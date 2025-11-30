@@ -1,0 +1,6 @@
+client
+server
+.vscode/
+*.o
+*.out
+hoard.txt

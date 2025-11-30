@@ -1,0 +1,54 @@
+#ifndef BRUSHES_H
+#define BRUSHES_H
+
+#include <SDL2/SDL.h>
+#include <functional>
+#include <cmath>
+
+// Common typedef used in both server and client
+typedef SDL_Color Pixel;
+
+// Abstract Base Class for Brushes
+class Brush {
+public:
+    int size = 5;
+    virtual ~Brush() = default;
+    
+    // Paint function: takes coordinates, color, size, and a callback to set a pixel
+    // The callback allows this to be used with both Server (array) and Client (renderer/texture)
+    virtual void paint(int x, int y, Pixel color, int size, std::function<void(int, int, Pixel)> setPixel) = 0;
+};
+
+// Derived: Round Brush (Standard)
+class RoundBrush : public Brush {
+public:
+    void paint(int x, int y, Pixel color, int size, std::function<void(int, int, Pixel)> setPixel) override {
+        int r = size / 2;
+        if (r < 1) {
+            setPixel(x, y, color);
+            return;
+        }
+        for (int i = -r; i <= r; i++) {
+            for (int j = -r; j <= r; j++) {
+                if (i*i + j*j <= r*r) {
+                    setPixel(x + i, y + j, color);
+                }
+            }
+        }
+    }
+};
+
+// Derived: Square Brush
+class SquareBrush : public Brush {
+public:
+    void paint(int x, int y, Pixel color, int size, std::function<void(int, int, Pixel)> setPixel) override {
+        int r = size / 2;
+        for (int i = -r; i <= r; i++) {
+            for (int j = -r; j <= r; j++) {
+                setPixel(x + i, y + j, color);
+            }
+        }
+    }
+};
+
+#endif
