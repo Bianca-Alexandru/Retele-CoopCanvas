@@ -1,6 +1,10 @@
-client
-server
-.vscode/
-*.o
-*.out
-hoard.txt
+# Ignore everything
+*
+
+# Whitelist specific files
+!client.cpp
+!server.cpp
+!brushes.h
+!ui.h
+!diagram.txt
+!.gitignore

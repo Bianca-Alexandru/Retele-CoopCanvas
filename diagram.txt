@@ -1,0 +1,94 @@
+title Co-op Canvas Architecture
+
+# Define Participants
+participantgroup #lightgrey **Client Side**
+    actor User
+    participant "Main Thread\n(UI/SDL)" as ClientMain
+    participant "TCP Receiver" as ClientTCP
+    participant "UDP Receiver" as ClientUDP
+end
+
+participantgroup #lightblue **Server Side**
+    participant "Server Main\n(Accept Loop)" as ServerMain
+    participant "TCP Client Thread\n(One per Client)" as ServerTCP
+    participant "UDP Canvas Thread\n(One per Canvas)" as ServerUDP
+    participant "Autosave Thread" as ServerSave
+end
+
+# --- STARTUP & LOGIN FLOW ---
+ServerMain->ServerSave: Start Autosave Thread
+activate ServerSave
+
+User->ClientMain: Starts App
+ClientMain->ClientMain: Setup UI & SDL
+
+User->ClientMain: Clicks "Login" (Canvas n)
+ClientMain->ServerMain: TCP Connect (Port 6769)
+activate ServerMain
+ServerMain->ServerTCP: Start Client Thread
+activate ServerTCP
+ServerMain-->ClientMain: Connection Accepted
+deactivate ServerMain
+
+ClientMain->ServerTCP: MSG_LOGIN (Canvas n, "User1")
+note right of ServerTCP: Check if Canvas n exists.\nIf not, create it.
+
+ServerTCP->ServerUDP: Start Canvas Thread (if needed)
+activate ServerUDP
+ServerUDP->ServerUDP: Bind UDP Port 6770+n
+
+ServerTCP-->ClientMain: MSG_WELCOME (Layer Count)
+ServerTCP-->ClientMain: MSG_CANVAS_DATA (Full Layer History)
+
+ClientMain->ClientTCP: Start TCP Receiver Thread
+activate ClientTCP
+ClientMain->ClientUDP: Start UDP Receiver Thread (Port 6772)
+activate ClientUDP
+
+# --- DRAWING FLOW (UDP) ---
+note over User, ServerUDP: Real-time Drawing (High Frequency)
+
+User->ClientMain: Drag Mouse (Draw)
+ClientMain->ClientMain: Apply Locally (Immediate Feedback)
+ClientMain->ServerUDP: MSG_DRAW (UDP Packet)
+
+ServerUDP->ServerUDP: Update Server Pixel Array
+ServerUDP->ClientUDP: Broadcast MSG_DRAW (to other clients)
+note right of ServerUDP: Sent to everyone EXCEPT sender
+
+ClientUDP->ClientMain: Update Remote Layer
+ClientMain->User: Render Frame
+
+# --- LAYER MANAGEMENT FLOW (TCP) ---
+note over User, ServerTCP: Layer Operations (Reliable)
+
+User->ClientMain: Click "Add Layer"
+ClientMain->ServerTCP: MSG_LAYER_ADD
+
+ServerTCP->ServerTCP: Create New Layer
+ServerTCP->ClientTCP: Broadcast MSG_LAYER_ADD (New Count)
+
+ClientTCP->ClientTCP: Update Local Layer Count
+ClientTCP->ClientMain: Set pendingLayerUpdate = true
+ClientMain->ClientMain: Update UI Buttons
+
+# --- UNDO/REDO SYNC FLOW ---
+note over User, ServerTCP: Undo Synchronization
+
+User->ClientMain: Click "Undo"
+ClientMain->ClientMain: Restore Local Snapshot
+ClientMain->ServerTCP: MSG_LAYER_SYNC (Full Layer Data)
+
+ServerTCP->ServerTCP: Update Server Layer
+ServerTCP->ClientTCP: Broadcast MSG_LAYER_SYNC
+
+ClientTCP->ClientTCP: Overwrite Local Layer
+ClientTCP->ClientMain: Render Updated Canvas
+
+# --- AUTOSAVE FLOW ---
+
+loop Every 60 Seconds
+    ServerSave->ServerSave: Lock Mutex
+    ServerSave->ServerSave: Write canvas.json
+    ServerSave->ServerSave: Unlock Mutex
+end

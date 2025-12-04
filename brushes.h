@@ -51,4 +51,19 @@ public:
     }
 };
 
+class HardEraserBrush : public Brush {
+public:
+    void paint(int x, int y, Pixel color, int size, std::function<void(int, int, Pixel)> setPixel) override {
+        (void)color; // unused
+        int r = size / 2;
+        for (int i = -r; i <= r; i++) {
+            for (int j = -r; j <= r; j++) {
+                // Set to white (paper color) for display, transparent for layer storage
+                Pixel erased = {255, 255, 255, 0};  // alpha=0 means erased on layer
+                setPixel(x + i, y + j, erased);
+            }
+        }
+    }
+};
+
 #endif

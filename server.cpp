@@ -1,9 +1,23 @@
 /* 
    TCP/UDP Hybrid Server - Shared Canvas
+   Multi-Canvas with Per-Canvas Thread Architecture + Multi-Layer Support
    
-   Protocol Scheme:
-   UDP: DRAW, CURSOR, UNDO, REDO (Fast, high volume updates)
-   TCP: LOGIN, CONNECT, COLOR, BRUSH (Reliable control messages)
+   Architecture:
+   - Main thread: Accepts TCP connections, handles login, routes clients to canvas threads
+   - Canvas threads: One per active canvas, handles all UDP for that canvas
+   - Autosave thread: Periodically saves all active canvases
+   
+   Layer System:
+   - Layer 0: White paper background (not stored, always white)
+   - Layer 1+: Transparent layers where users draw (stored in JSON)
+   
+   Protocol:
+   - TCP: Login (with canvas_id), Save, Layer operations
+   - UDP: Draw, Line, Cursor (no canvas_id needed - each canvas has its own UDP port)
+   
+   Port Scheme:
+   - Base port (6769): TCP connections
+   - Base + canvas_id + 1: UDP for each canvas (6770, 6771, etc.)
 */
 
 #include <sys/types.h>
@@ -19,314 +33,923 @@
 #include <pthread.h>
 #include <vector>
 #include <string>
+#include <map>
 #include <algorithm>
 #include <stdint.h>
 #include <SDL2/SDL.h>
 #include "brushes.h"
 
+using namespace std;
+
 #define PORT 6769
 #define WIDTH 640
 #define HEIGHT 480
+#define MAX_LAYERS 10
 
 extern int errno;
 
-/* --- PROTOCOL STRUCTURES --- */
+/* ============================================================================
+   PROTOCOL STRUCTURES
+   ============================================================================ */
 
-// Message Types
 enum MsgType {
-    MSG_DRAW = 1,
-    MSG_CURSOR = 2,
-    MSG_UNDO = 3,
-    MSG_REDO = 4,
-    MSG_LOGIN = 5,
-    MSG_CONNECT = 6,
-    MSG_COLOR = 7,
-    MSG_BRUSH = 8,
-    MSG_LINE = 9
+    MSG_LOGIN = 1,
+    MSG_LOGOUT = 2,
+    MSG_WELCOME = 3,
+    MSG_CANVAS_DATA = 4,
+    MSG_SAVE = 5,
+    MSG_DRAW = 6,
+    MSG_CURSOR = 7,
+    MSG_LINE = 8,
+    MSG_ERROR = 9,
+    MSG_LAYER_ADD = 10,
+    MSG_LAYER_DEL = 11,
+    MSG_LAYER_SELECT = 12,
+    MSG_LAYER_SYNC = 13  // Full layer data sync (for undo/redo)
 };
 
-// UDP Message Structure (Draw, Cursor, Undo, Redo)
-struct UDPMessage {
-    int type;           // MSG_DRAW, MSG_CURSOR, MSG_UNDO, MSG_REDO
-    int x, y;           // Coordinates (Start for Line)
-    int ex, ey;         // End Coordinates (for Line)
-    int id_brush;       // Brush ID
-    int size;           // Brush Size
-    SDL_Color color;    // Color
-    float pressure;     // Pressure (0.0 - 1.0)
-    int layer;          // Layer ID
-};
-
-// TCP Message Structure (Login, Connect, Color, Brush)
+// TCP Message (packed for network)
 struct TCPMessage {
-    int type;           // MSG_LOGIN, MSG_CONNECT, MSG_COLOR, MSG_BRUSH
-    char username[64];  // For Login
-    int id_canvas;      // For Connect
-    SDL_Color color;    // For Color update
-    int id_brush;       // For Brush update
-};
+    uint8_t  type;
+    uint8_t  canvas_id;
+    uint16_t data_len;
+    uint8_t  layer_count;
+    uint8_t  layer_id;
+    char     data[256];
+} __attribute__((packed));
 
-/* --- GLOBAL STATE --- */
+// UDP Message (packed for network)
+struct UDPMessage {
+    uint8_t  type;
+    uint8_t  brush_id;
+    uint8_t  layer_id;
+    int16_t  x;
+    int16_t  y;
+    int16_t  ex, ey;  // for line drawing
+    uint8_t  r, g, b, a;
+    uint8_t  size;
+} __attribute__((packed));
 
-Pixel canvas[WIDTH][HEIGHT];
-std::vector<int> tcp_clients;
-std::vector<struct sockaddr_in> udp_clients; // List of known UDP clients
-pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
-std::vector<Brush*> availableBrushes;
+/* ============================================================================
+   LAYER STRUCTURE
+   ============================================================================ */
 
-int udp_socket; // Global UDP socket
-
-/* --- HELPER FUNCTIONS --- */
-
-void init_canvas() {
-    for(int x=0; x<WIDTH; x++) {
-        for(int y=0; y<HEIGHT; y++) {
-            canvas[x][y] = {255, 255, 255, 255}; // White
+struct Layer {
+    Pixel pixels[WIDTH][HEIGHT];
+    
+    void init_transparent() {
+        for (int x = 0; x < WIDTH; x++) {
+            for (int y = 0; y < HEIGHT; y++) {
+                pixels[x][y] = {0, 0, 0, 0};
+            }
         }
     }
-}
+    
+    void init_white() {
+        for (int x = 0; x < WIDTH; x++) {
+            for (int y = 0; y < HEIGHT; y++) {
+                pixels[x][y] = {255, 255, 255, 255};
+            }
+        }
+    }
+};
 
-// Helper to compare sockaddr_in
+/* ============================================================================
+   CANVAS ROOM STRUCTURE
+   ============================================================================ */
+
+struct CanvasRoom {
+    int id;
+    vector<Layer*> layers;
+    
+    int udp_socket;
+    int udp_port;
+    pthread_t thread;
+    bool active;
+    
+    vector<struct sockaddr_in> udp_clients;
+    vector<int> tcp_clients;
+    pthread_mutex_t mutex;
+    
+    void init(int canvas_id) {
+        id = canvas_id;
+        active = false;
+        udp_socket = -1;
+        udp_port = PORT + 1 + canvas_id;
+        pthread_mutex_init(&mutex, NULL);
+        
+        Layer* paper = new Layer();
+        paper->init_white();
+        layers.push_back(paper);
+        
+        Layer* layer1 = new Layer();
+        layer1->init_transparent();
+        layers.push_back(layer1);
+        
+        printf("[Server][Canvas %d] Initialized with %zu layers (paper + 1 drawable)\n", id, layers.size());
+    }
+    
+    void add_layer() {
+        if (layers.size() >= MAX_LAYERS) {
+            printf("[Server][Canvas %d] Cannot add layer: max %d layers reached\n", id, MAX_LAYERS);
+            return;
+        }
+        Layer* newLayer = new Layer();
+        newLayer->init_transparent();
+        layers.push_back(newLayer);
+        printf("[Server][Canvas %d] Added layer #%zu (total: %zu)\n", id, layers.size() - 1, layers.size());
+    }
+    
+    void delete_layer(int layer_idx) {
+        if (layer_idx <= 0 || layer_idx >= (int)layers.size()) {
+            printf("[Server][Canvas %d] Cannot delete layer %d: invalid index\n", id, layer_idx);
+            return;
+        }
+        if (layers.size() <= 2) {
+            printf("[Server][Canvas %d] Cannot delete layer %d: must keep at least 1 drawable\n", id, layer_idx);
+            return;
+        }
+        delete layers[layer_idx];
+        layers.erase(layers.begin() + layer_idx);
+        printf("[Server][Canvas %d] Deleted layer #%d (remaining: %zu)\n", id, layer_idx, layers.size());
+    }
+    
+    void flatten_to_buffer(Pixel* buffer) {
+        for (int x = 0; x < WIDTH; x++) {
+            for (int y = 0; y < HEIGHT; y++) {
+                buffer[x * HEIGHT + y] = {255, 255, 255, 255};
+            }
+        }
+        for (size_t l = 1; l < layers.size(); l++) {
+            for (int x = 0; x < WIDTH; x++) {
+                for (int y = 0; y < HEIGHT; y++) {
+                    Pixel src = layers[l]->pixels[x][y];
+                    if (src.a > 0) {
+                        Pixel& dst = buffer[x * HEIGHT + y];
+                        float srcA = src.a / 255.0f;
+                        float dstA = dst.a / 255.0f;
+                        float outA = srcA + dstA * (1 - srcA);
+                        if (outA > 0) {
+                            dst.r = (src.r * srcA + dst.r * dstA * (1 - srcA)) / outA;
+                            dst.g = (src.g * srcA + dst.g * dstA * (1 - srcA)) / outA;
+                            dst.b = (src.b * srcA + dst.b * dstA * (1 - srcA)) / outA;
+                            dst.a = outA * 255;
+                        }
+                    }
+                }
+            }
+        }
+    }
+};
+
+/* ============================================================================
+   GLOBAL STATE
+   ============================================================================ */
+
+map<int, CanvasRoom*> canvases;  // On-demand canvas creation
+pthread_mutex_t canvases_mutex = PTHREAD_MUTEX_INITIALIZER;
+vector<Brush*> availableBrushes;
+
+// Track drawing state per client for less spammy logs
+map<string, bool> client_drawing;
+
+/* ============================================================================
+   HELPER FUNCTIONS
+   ============================================================================ */
+
 bool is_same_address(struct sockaddr_in a, struct sockaddr_in b) {
     return (a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port);
 }
 
-void add_udp_client(struct sockaddr_in client_addr) {
-    pthread_mutex_lock(&state_mutex);
-    bool found = false;
-    for(const auto& addr : udp_clients) {
-        if(is_same_address(addr, client_addr)) {
-            found = true;
-            break;
-        }
-    }
-    if(!found) {
-        udp_clients.push_back(client_addr);
-        printf("[UDP] New client registered: %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-    }
-    pthread_mutex_unlock(&state_mutex);
+string addr_to_key(struct sockaddr_in addr) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s:%d", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+    return string(buf);
 }
 
-void broadcast_udp(UDPMessage msg, struct sockaddr_in sender) {
-    pthread_mutex_lock(&state_mutex);
-    for(const auto& client_addr : udp_clients) {
-        // Don't send back to sender
-        if(!is_same_address(client_addr, sender)) {
-            sendto(udp_socket, &msg, sizeof(UDPMessage), 0, (struct sockaddr*)&client_addr, sizeof(client_addr));
-        }
-    }
-    pthread_mutex_unlock(&state_mutex);
-}
+// Forward declaration
+CanvasRoom* get_or_create_canvas(int canvas_id);
 
-void draw_line_on_canvas(int x0, int y0, int x1, int y1, Pixel color) {
-    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy, e2;
+/* ============================================================================
+   CANVAS UDP THREAD
+   ============================================================================ */
 
-    while (1) {
-        if (x0 >= 0 && x0 < WIDTH && y0 >= 0 && y0 < HEIGHT) {
-            canvas[x0][y0] = color;
-        }
-        if (x0 == x1 && y0 == y1) break;
-        e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
-    }
-}
-
-/* --- UDP SERVER LOGIC --- */
-
-void* udp_listener_thread(void* arg) {
+void* canvas_udp_thread(void* arg) {
+    int canvas_id = *((int*)arg);
+    free(arg);
+    
+    CanvasRoom* room = get_or_create_canvas(canvas_id);
+    
+    printf("[Server][Canvas %d][UDP] Thread started on port %d\n", canvas_id, room->udp_port);
+    
     UDPMessage msg;
     struct sockaddr_in sender_addr;
     socklen_t len = sizeof(sender_addr);
-
-    printf("[UDP] Listener thread started.\n");
-
-    while(1) {
-        int bytes = recvfrom(udp_socket, &msg, sizeof(UDPMessage), 0, (struct sockaddr*)&sender_addr, &len);
-        if(bytes > 0) {
-            // 1. Register client if new
-            add_udp_client(sender_addr);
-
-            // 2. Process Message
-            if(msg.type == MSG_DRAW) {
-                // Update Canvas
-                pthread_mutex_lock(&state_mutex);
-                auto setPixel = [&](int px, int py, Pixel c) {
-                    if(px >= 0 && px < WIDTH && py >= 0 && py < HEIGHT) {
-                        canvas[px][py] = c;
-                    }
-                };
-                if(msg.id_brush >= 0 && msg.id_brush < availableBrushes.size()) {
-                    availableBrushes[msg.id_brush]->paint(msg.x, msg.y, msg.color, msg.size, setPixel);
+    
+    while (room->active) {
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        setsockopt(room->udp_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        
+        int bytes = recvfrom(room->udp_socket, &msg, sizeof(UDPMessage), 0, 
+                             (struct sockaddr*)&sender_addr, &len);
+        
+        if (bytes <= 0) continue;
+        
+        string client_key = addr_to_key(sender_addr);
+        
+        pthread_mutex_lock(&room->mutex);
+        bool found = false;
+        for (const auto& addr : room->udp_clients) {
+            if (is_same_address(addr, sender_addr)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            room->udp_clients.push_back(sender_addr);
+            printf("[Server][Canvas %d][UDP] New client: %s (total: %zu)\n", 
+                   canvas_id, client_key.c_str(), room->udp_clients.size());
+        }
+        pthread_mutex_unlock(&room->mutex);
+        
+        if (msg.type == MSG_DRAW) {
+            int layer_idx = msg.layer_id;
+            if (layer_idx <= 0 || layer_idx >= (int)room->layers.size()) {
+                layer_idx = 1;
+            }
+            
+            SDL_Color col = {msg.r, msg.g, msg.b, msg.a};
+            
+            // Only log when drawing starts
+            if (!client_drawing[client_key]) {
+                client_drawing[client_key] = true;
+                printf("[Server][Canvas %d][UDP] DRAW START: client=%s layer=%d brush=%d size=%d color=RGBA(%d,%d,%d,%d)\n",
+                       canvas_id, client_key.c_str(), layer_idx, msg.brush_id, msg.size, msg.r, msg.g, msg.b, msg.a);
+            }
+            
+            pthread_mutex_lock(&room->mutex);
+            auto setPixel = [&](int px, int py, Pixel c) {
+                if (px >= 0 && px < WIDTH && py >= 0 && py < HEIGHT) {
+                    room->layers[layer_idx]->pixels[px][py] = c;
                 }
-                pthread_mutex_unlock(&state_mutex);
-                
-                // Broadcast to others
-                broadcast_udp(msg, sender_addr);
+            };
+            if (msg.brush_id < (int)availableBrushes.size()) {
+                availableBrushes[msg.brush_id]->paint(msg.x, msg.y, col, msg.size, setPixel);
             }
-            else if(msg.type == MSG_LINE) {
-                // Update Canvas with Line
-                pthread_mutex_lock(&state_mutex);
-                
-                int x0 = msg.x, y0 = msg.y;
-                int x1 = msg.ex, y1 = msg.ey;
-                int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-                int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-                int err = dx + dy, e2;
-                
-                auto setPixel = [&](int px, int py, Pixel c) {
-                    if(px >= 0 && px < WIDTH && py >= 0 && py < HEIGHT) {
-                        canvas[px][py] = c;
-                    }
-                };
-
-                while (1) {
-                    if(msg.id_brush >= 0 && msg.id_brush < availableBrushes.size()) {
-                        availableBrushes[msg.id_brush]->paint(x0, y0, msg.color, msg.size, setPixel);
-                    }
-                    if (x0 == x1 && y0 == y1) break;
-                    e2 = 2 * err;
-                    if (e2 >= dy) { err += dy; x0 += sx; }
-                    if (e2 <= dx) { err += dx; y0 += sy; }
+            pthread_mutex_unlock(&room->mutex);
+            
+            pthread_mutex_lock(&room->mutex);
+            int bc = 0;
+            for (const auto& client : room->udp_clients) {
+                if (!is_same_address(client, sender_addr)) {
+                    sendto(room->udp_socket, &msg, sizeof(UDPMessage), 0,
+                           (struct sockaddr*)&client, sizeof(client));
+                    bc++;
                 }
-                
-                pthread_mutex_unlock(&state_mutex);
-                
-                // Broadcast to others
-                broadcast_udp(msg, sender_addr);
             }
-            else if(msg.type == MSG_CURSOR) {
-                // Just broadcast cursor position
-                broadcast_udp(msg, sender_addr);
+            pthread_mutex_unlock(&room->mutex);
+        }
+        else if (msg.type == MSG_CURSOR) {
+            // Cursor also marks end of drawing
+            if (client_drawing[client_key]) {
+                client_drawing[client_key] = false;
+                printf("[Server][Canvas %d][UDP] DRAW END: client=%s\n", canvas_id, client_key.c_str());
             }
-            // Handle UNDO/REDO...
+            pthread_mutex_lock(&room->mutex);
+            for (const auto& client : room->udp_clients) {
+                if (!is_same_address(client, sender_addr)) {
+                    sendto(room->udp_socket, &msg, sizeof(UDPMessage), 0,
+                           (struct sockaddr*)&client, sizeof(client));
+                }
+            }
+            pthread_mutex_unlock(&room->mutex);
+        }
+        else if (msg.type == MSG_LINE) {
+            int layer_idx = msg.layer_id;
+            if (layer_idx <= 0 || layer_idx >= (int)room->layers.size()) {
+                layer_idx = 1;
+            }
+            
+            SDL_Color col = {msg.r, msg.g, msg.b, msg.a};
+            printf("[Server][Canvas %d][UDP] LINE: client=%s from=(%d,%d) to=(%d,%d) layer=%d brush=%d\n",
+                   canvas_id, client_key.c_str(), msg.x, msg.y, msg.ex, msg.ey, layer_idx, msg.brush_id);
+            
+            pthread_mutex_lock(&room->mutex);
+            
+            int x0 = msg.x, y0 = msg.y;
+            int x1 = msg.ex, y1 = msg.ey;
+            int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+            int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+            int err = dx + dy, e2;
+            
+            auto setPixel = [&](int px, int py, Pixel c) {
+                if (px >= 0 && px < WIDTH && py >= 0 && py < HEIGHT) {
+                    room->layers[layer_idx]->pixels[px][py] = c;
+                }
+            };
+
+            while (1) {
+                if (msg.brush_id < (int)availableBrushes.size()) {
+                    availableBrushes[msg.brush_id]->paint(x0, y0, col, msg.size, setPixel);
+                }
+                if (x0 == x1 && y0 == y1) break;
+                e2 = 2 * err;
+                if (e2 >= dy) { err += dy; x0 += sx; }
+                if (e2 <= dx) { err += dx; y0 += sy; }
+            }
+            
+            pthread_mutex_unlock(&room->mutex);
+            
+            pthread_mutex_lock(&room->mutex);
+            int bc = 0;
+            for (const auto& client : room->udp_clients) {
+                if (!is_same_address(client, sender_addr)) {
+                    sendto(room->udp_socket, &msg, sizeof(UDPMessage), 0,
+                           (struct sockaddr*)&client, sizeof(client));
+                    bc++;
+                }
+            }
+            pthread_mutex_unlock(&room->mutex);
+            printf("[Server][Canvas %d][UDP] LINE broadcast to %d clients\n", canvas_id, bc);
         }
     }
+    
+    printf("[Server][Canvas %d][UDP] Thread stopped\n", canvas_id);
+    close(room->udp_socket);
     return NULL;
 }
 
-/* --- TCP SERVER LOGIC --- */
+/* ============================================================================
+   START/STOP CANVAS THREAD
+   ============================================================================ */
 
-void send_canvas_history(int client_sock) {
-    pthread_mutex_lock(&state_mutex);
-    size_t total_size = WIDTH * HEIGHT * sizeof(Pixel);
-    size_t sent = 0;
-    char* ptr = (char*)canvas;
+CanvasRoom* get_or_create_canvas(int canvas_id) {
+    pthread_mutex_lock(&canvases_mutex);
     
-    while(sent < total_size) {
-        int w = write(client_sock, ptr + sent, total_size - sent);
-        if(w <= 0) break;
-        sent += w;
+    if (canvases.find(canvas_id) == canvases.end()) {
+        printf("[Server] Creating new canvas #%d on demand\n", canvas_id);
+        CanvasRoom* room = new CanvasRoom();
+        room->init(canvas_id);
+        canvases[canvas_id] = room;
     }
-    pthread_mutex_unlock(&state_mutex);
+    
+    CanvasRoom* room = canvases[canvas_id];
+    pthread_mutex_unlock(&canvases_mutex);
+    return room;
 }
 
-void* tcp_client_session(void *arg) {
-    int client_sock = *((int*)arg);
-    free(arg);
-    
-    pthread_detach(pthread_self());
-    
-    // Register TCP client
-    pthread_mutex_lock(&state_mutex);
-    tcp_clients.push_back(client_sock);
-    pthread_mutex_unlock(&state_mutex);
-
-    printf("[TCP] Client connected (Socket %d)\n", client_sock);
-
-    // Send initial canvas state
-    send_canvas_history(client_sock);
-
-    TCPMessage msg;
-    while(1) {
-        int bytes = read(client_sock, &msg, sizeof(TCPMessage));
-        if(bytes <= 0) {
-            printf("[TCP] Client disconnected (Socket %d)\n", client_sock);
-            break;
-        }
-
-        // Handle TCP Messages
-        switch(msg.type) {
-            case MSG_LOGIN:
-                printf("[TCP] Login: %s\n", msg.username);
-                break;
-            case MSG_CONNECT:
-                printf("[TCP] Connect to Canvas ID: %d\n", msg.id_canvas);
-                break;
-            case MSG_COLOR:
-                printf("[TCP] Color changed.\n");
-                break;
-            case MSG_BRUSH:
-                printf("[TCP] Brush changed to ID: %d\n", msg.id_brush);
-                break;
-        }
+bool start_canvas_thread(int canvas_id) {
+    if (canvas_id < 0) {
+        printf("[Server] ERROR: Invalid canvas_id %d\n", canvas_id);
+        return false;
     }
-
-    // Cleanup
-    close(client_sock);
-    pthread_mutex_lock(&state_mutex);
-    tcp_clients.erase(std::remove(tcp_clients.begin(), tcp_clients.end(), client_sock), tcp_clients.end());
-    pthread_mutex_unlock(&state_mutex);
     
-    return NULL;
+    CanvasRoom* room = get_or_create_canvas(canvas_id);
+    
+    pthread_mutex_lock(&canvases_mutex);
+    
+    if (room->active) {
+        printf("[Server][Canvas %d] Thread already running\n", canvas_id);
+        pthread_mutex_unlock(&canvases_mutex);
+        return true;
+    }
+    
+    room->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (room->udp_socket < 0) {
+        perror("[Server] UDP socket failed");
+        pthread_mutex_unlock(&canvases_mutex);
+        return false;
+    }
+    
+    struct sockaddr_in addr;
+    bzero(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(room->udp_port);
+    
+    if (bind(room->udp_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        printf("[Server] ERROR: UDP bind failed for port %d\n", room->udp_port);
+        close(room->udp_socket);
+        pthread_mutex_unlock(&canvases_mutex);
+        return false;
+    }
+    
+    room->active = true;
+    
+    int* arg = (int*)malloc(sizeof(int));
+    *arg = canvas_id;
+    pthread_create(&room->thread, NULL, canvas_udp_thread, arg);
+    
+    printf("[Server][Canvas %d] Thread STARTED on UDP port %d\n", canvas_id, room->udp_port);
+    
+    pthread_mutex_unlock(&canvases_mutex);
+    return true;
 }
 
-/* --- JSON EXPORT (Isolated) --- */
+/* ============================================================================
+   PERSISTENCE - Single canvas.json with all canvases and layers
+   ============================================================================ */
 
-static const char* b64_table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static const string b64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-std::string base64_encode(const unsigned char* data, size_t len) {
-    std::string out;
+bool is_base64(unsigned char c) {
+    return (isalnum(c) || (c == '+') || (c == '/'));
+}
+
+string base64_encode(const unsigned char* data, size_t len) {
+    string out;
     out.reserve(4 * ((len + 2) / 3));
     int val = 0, valb = -6;
     for (size_t i = 0; i < len; i++) {
         val = (val << 8) + data[i];
         valb += 8;
         while (valb >= 0) {
-            out.push_back(b64_table[(val >> valb) & 0x3F]);
+            out.push_back(b64_chars[(val >> valb) & 0x3F]);
             valb -= 6;
         }
     }
-    if (valb > -6) out.push_back(b64_table[((val << 8) >> (valb + 8)) & 0x3F]);
+    if (valb > -6) out.push_back(b64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
     while (out.size() % 4) out.push_back('=');
     return out;
 }
 
-void save_canvas_json() {
-    std::vector<uint32_t> buffer;
+vector<unsigned char> base64_decode(const string& encoded_string) {
+    int in_len = encoded_string.size();
+    int i = 0, j = 0, in_ = 0;
+    unsigned char char_array_4[4], char_array_3[3];
+    vector<unsigned char> ret;
+
+    while (in_len-- && encoded_string[in_] != '=' && is_base64(encoded_string[in_])) {
+        char_array_4[i++] = encoded_string[in_]; in_++;
+        if (i == 4) {
+            for (i = 0; i < 4; i++)
+                char_array_4[i] = b64_chars.find(char_array_4[i]);
+
+            char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
+            char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+            char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+
+            for (i = 0; i < 3; i++)
+                ret.push_back(char_array_3[i]);
+            i = 0;
+        }
+    }
+
+    if (i) {
+        for (j = i; j < 4; j++) char_array_4[j] = 0;
+        for (j = 0; j < 4; j++) char_array_4[j] = b64_chars.find(char_array_4[j]);
+
+        char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
+        char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+        char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+
+        for (j = 0; j < i - 1; j++) ret.push_back(char_array_3[j]);
+    }
+
+    return ret;
+}
+
+string encode_layer(Layer* layer) {
+    vector<uint32_t> buffer;
     buffer.reserve(WIDTH * HEIGHT);
     
-    for(int y=0; y<HEIGHT; y++) {
-        for(int x=0; x<WIDTH; x++) {
-            Pixel p = canvas[x][y];
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            Pixel p = layer->pixels[x][y];
             uint32_t packed = (p.r << 24) | (p.g << 16) | (p.b << 8) | p.a;
             buffer.push_back(packed);
         }
     }
-
-    std::string b64 = base64_encode((const unsigned char*)buffer.data(), buffer.size() * sizeof(uint32_t));
-
-    printf("{\n");
-    printf("  \"width\": %d,\n", WIDTH);
-    printf("  \"height\": %d,\n", HEIGHT);
-    printf("  \"data\": \"%s\"\n", b64.c_str());
-    printf("}\n");
+    
+    return base64_encode((const unsigned char*)buffer.data(), buffer.size() * sizeof(uint32_t));
 }
 
-/* --- MAIN --- */
+void decode_layer(Layer* layer, const string& b64) {
+    vector<unsigned char> data = base64_decode(b64);
+    uint32_t* pixels = (uint32_t*)data.data();
+    int count = 0;
+    int max_pixels = data.size() / sizeof(uint32_t);
+    
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            if (count < max_pixels) {
+                uint32_t p = pixels[count++];
+                layer->pixels[x][y].r = (p >> 24) & 0xFF;
+                layer->pixels[x][y].g = (p >> 16) & 0xFF;
+                layer->pixels[x][y].b = (p >> 8) & 0xFF;
+                layer->pixels[x][y].a = p & 0xFF;
+            }
+        }
+    }
+}
+
+void save_all_canvases() {
+    printf("\n[Server][Save] ========== SAVING TO canvas.json ==========\n");
+    
+    FILE* f = fopen("canvas.json", "w");
+    if (!f) {
+        printf("[Server][Save] ERROR: Cannot open canvas.json\n");
+        return;
+    }
+    
+    fprintf(f, "{\n  \"version\": 2,\n  \"width\": %d,\n  \"height\": %d,\n  \"canvases\": [\n", WIDTH, HEIGHT);
+    
+    bool first_canvas = true;
+    int saved_count = 0;
+    
+    for (auto& pair : canvases) {
+        int c = pair.first;
+        CanvasRoom* room = pair.second;
+        
+        // Check if has content
+        bool has_content = false;
+        for (size_t l = 1; l < room->layers.size() && !has_content; l++) {
+            for (int x = 0; x < WIDTH && !has_content; x++) {
+                for (int y = 0; y < HEIGHT && !has_content; y++) {
+                    if (room->layers[l]->pixels[x][y].a > 0) has_content = true;
+                }
+            }
+        }
+        if (!has_content && !room->active) continue;
+        
+        if (!first_canvas) fprintf(f, ",\n");
+        first_canvas = false;
+        
+        printf("[Server][Save] Canvas #%d: %zu layers\n", c, room->layers.size());
+        
+        pthread_mutex_lock(&room->mutex);
+        
+        fprintf(f, "    {\n      \"id\": %d,\n      \"layer_count\": %zu,\n      \"layers\": [\n", c, room->layers.size() - 1);
+        
+        for (size_t l = 1; l < room->layers.size(); l++) {
+            string b64 = encode_layer(room->layers[l]);
+            printf("[Server][Save] Canvas #%d Layer %zu: %zu bytes encoded\n", c, l, b64.length());
+            fprintf(f, "        {\"index\": %zu, \"data\": \"%s\"}%s\n", l, b64.c_str(), (l < room->layers.size() - 1) ? "," : "");
+        }
+        
+        fprintf(f, "      ]\n    }");
+        pthread_mutex_unlock(&room->mutex);
+        saved_count++;
+    }
+    
+    fprintf(f, "\n  ]\n}\n");
+    fclose(f);
+    
+    printf("[Server][Save] Saved %d canvases\n", saved_count);
+    printf("[Server][Save] ========== SAVE COMPLETE ==========\n\n");
+}
+
+void load_all_canvases() {
+    printf("\n[Server][Load] ========== LOADING canvas.json ==========\n");
+    
+    FILE* f = fopen("canvas.json", "r");
+    if (!f) {
+        printf("[Server][Load] No canvas.json found - starting fresh\n");
+        return;
+    }
+    
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    printf("[Server][Load] File size: %ld bytes\n", fsize);
+    
+    char* buffer = (char*)malloc(fsize + 1);
+    fread(buffer, 1, fsize, f);
+    buffer[fsize] = 0;
+    fclose(f);
+    
+    string json = buffer;
+    free(buffer);
+    
+    size_t pos = 0;
+    while ((pos = json.find("\"id\":", pos)) != string::npos) {
+        size_t id_start = pos + 5;
+        while (id_start < json.size() && (json[id_start] == ' ' || json[id_start] == '\t')) id_start++;
+        int canvas_id = atoi(json.c_str() + id_start);
+        
+        if (canvas_id < 0) { pos++; continue; }
+        
+        printf("[Server][Load] Found canvas #%d\n", canvas_id);
+        
+        // Create or get the canvas on demand
+        CanvasRoom* room = get_or_create_canvas(canvas_id);
+        
+        size_t layers_start = json.find("\"layers\":", pos);
+        if (layers_start == string::npos) { pos++; continue; }
+        
+        size_t canvas_end = json.find("}]", layers_start);
+        if (canvas_end == string::npos) canvas_end = json.size();
+        
+        size_t layer_pos = layers_start;
+        int layer_count = 0;
+        
+        while ((layer_pos = json.find("\"data\":", layer_pos)) != string::npos && layer_pos < canvas_end) {
+            size_t data_start = json.find("\"", layer_pos + 7);
+            if (data_start == string::npos) break;
+            data_start++;
+            
+            size_t data_end = json.find("\"", data_start);
+            if (data_end == string::npos) break;
+            
+            string b64 = json.substr(data_start, data_end - data_start);
+            
+            while (room->layers.size() <= (size_t)(layer_count + 1)) {
+                Layer* newLayer = new Layer();
+                newLayer->init_transparent();
+                room->layers.push_back(newLayer);
+            }
+            
+            decode_layer(room->layers[layer_count + 1], b64);
+            printf("[Server][Load] Canvas #%d Layer %d loaded\n", canvas_id, layer_count + 1);
+            
+            layer_count++;
+            layer_pos = data_end;
+        }
+        
+        printf("[Server][Load] Canvas #%d: %d drawable layers loaded\n", canvas_id, layer_count);
+        pos++;
+    }
+    
+    printf("[Server][Load] ========== LOAD COMPLETE ==========\n\n");
+}
+
+/* ============================================================================
+   AUTOSAVE THREAD
+   ============================================================================ */
+
+void* autosave_thread(void* arg) {
+    printf("[Server][Autosave] Thread started (interval: 60s)\n");
+    while (1) {
+        sleep(60);
+        printf("[Server][Autosave] Timer triggered\n");
+        pthread_mutex_lock(&canvases_mutex);
+        save_all_canvases();
+        pthread_mutex_unlock(&canvases_mutex);
+    }
+    return NULL;
+}
+
+/* ============================================================================
+   TCP SESSION HANDLER
+   ============================================================================ */
+
+void send_canvas_to_client(int sock, int canvas_id) {
+    CanvasRoom* room = get_or_create_canvas(canvas_id);
+    
+    printf("[Server][TCP] Sending canvas #%d to socket %d\n", canvas_id, sock);
+    
+    int layer_count = room->layers.size();
+    write(sock, &layer_count, sizeof(int));
+    printf("[Server][TCP] Sent layer_count: %d\n", layer_count);
+    
+    pthread_mutex_lock(&room->mutex);
+    
+    // Send each layer individually (skip layer 0 which is white paper)
+    // Convert from column-major (pixels[x][y]) to row-major (y * WIDTH + x) for client
+    uint8_t* buffer = new uint8_t[WIDTH * HEIGHT * 4];
+    
+    for (size_t l = 1; l < room->layers.size(); l++) {
+        // Convert to row-major RGBA format
+        for (int y = 0; y < HEIGHT; y++) {
+            for (int x = 0; x < WIDTH; x++) {
+                Pixel p = room->layers[l]->pixels[x][y];
+                int idx = (y * WIDTH + x) * 4;
+                buffer[idx + 0] = p.r;
+                buffer[idx + 1] = p.g;
+                buffer[idx + 2] = p.b;
+                buffer[idx + 3] = p.a;
+            }
+        }
+        
+        size_t total_size = WIDTH * HEIGHT * 4;
+        size_t sent = 0;
+        
+        while (sent < total_size) {
+            int w = write(sock, buffer + sent, total_size - sent);
+            if (w <= 0) break;
+            sent += w;
+        }
+        printf("[Server][TCP] Sent layer %zu (%zu bytes)\n", l, sent);
+    }
+    
+    delete[] buffer;
+    pthread_mutex_unlock(&room->mutex);
+    
+    printf("[Server][TCP] Sent canvas #%d complete\n", canvas_id);
+}
+
+void* tcp_client_session(void* arg) {
+    int client_sock = *((int*)arg);
+    free(arg);
+    
+    pthread_detach(pthread_self());
+    
+    printf("[Server][TCP] ===== Client connected (socket=%d) =====\n", client_sock);
+    
+    int client_canvas_id = -1;
+    
+    TCPMessage msg;
+    while (1) {
+        int bytes = read(client_sock, &msg, sizeof(TCPMessage));
+        if (bytes <= 0) {
+            printf("[Server][TCP] Client disconnected (socket=%d)\n", client_sock);
+            break;
+        }
+
+        switch (msg.type) {
+            case MSG_LOGIN: {
+                int canvas_id = msg.canvas_id;
+                if (canvas_id < 0) canvas_id = 0;
+                
+                printf("[Server][TCP] LOGIN: user='%s' canvas=%d\n", msg.data, canvas_id);
+                
+                if (!start_canvas_thread(canvas_id)) {
+                    printf("[Server][TCP] ERROR: Failed to start canvas thread\n");
+                    break;
+                }
+                
+                client_canvas_id = canvas_id;
+                
+                CanvasRoom* room = get_or_create_canvas(canvas_id);
+                pthread_mutex_lock(&room->mutex);
+                room->tcp_clients.push_back(client_sock);
+                printf("[Server][TCP] User '%s' registered to canvas #%d (clients: %zu)\n", 
+                       msg.data, canvas_id, room->tcp_clients.size());
+                pthread_mutex_unlock(&room->mutex);
+                
+                TCPMessage response;
+                memset(&response, 0, sizeof(response));
+                response.type = MSG_WELCOME;
+                response.canvas_id = canvas_id;
+                response.layer_count = room->layers.size();
+                write(client_sock, &response, sizeof(TCPMessage));
+                printf("[Server][TCP] Sent WELCOME (canvas=%d, layers=%d)\n", canvas_id, response.layer_count);
+                
+                // Send the actual canvas data to sync the new client
+                send_canvas_to_client(client_sock, canvas_id);
+                
+                printf("[Server][TCP] User '%s' logged into canvas #%d (UDP port %d)\n", 
+                       msg.data, canvas_id, room->udp_port);
+                break;
+            }
+            
+            case MSG_SAVE:
+                printf("[Server][TCP] SAVE request from socket %d\n", client_sock);
+                if (client_canvas_id >= 0) {
+                    pthread_mutex_lock(&canvases_mutex);
+                    save_all_canvases();
+                    pthread_mutex_unlock(&canvases_mutex);
+                }
+                break;
+                
+            case MSG_LAYER_ADD:
+                printf("[Server][TCP] LAYER_ADD request\n");
+                if (client_canvas_id >= 0) {
+                    CanvasRoom* room = get_or_create_canvas(client_canvas_id);
+                    pthread_mutex_lock(&room->mutex);
+                    room->add_layer();
+                    
+                    // Prepare response
+                    TCPMessage response;
+                    memset(&response, 0, sizeof(response));
+                    response.type = MSG_LAYER_ADD;
+                    response.canvas_id = client_canvas_id;
+                    response.layer_count = room->layers.size();
+                    
+                    // Broadcast to ALL clients on this canvas
+                    for (int sock : room->tcp_clients) {
+                        write(sock, &response, sizeof(TCPMessage));
+                    }
+                    printf("[Server][TCP] Broadcast LAYER_ADD to %zu clients (layers=%d)\n", 
+                           room->tcp_clients.size(), response.layer_count);
+                    
+                    pthread_mutex_unlock(&room->mutex);
+                }
+                break;
+                
+            case MSG_LAYER_DEL:
+                printf("[Server][TCP] LAYER_DEL request: layer=%d\n", msg.layer_id);
+                if (client_canvas_id >= 0) {
+                    CanvasRoom* room = get_or_create_canvas(client_canvas_id);
+                    pthread_mutex_lock(&room->mutex);
+                    room->delete_layer(msg.layer_id);
+                    
+                    // Prepare response
+                    TCPMessage response;
+                    memset(&response, 0, sizeof(response));
+                    response.type = MSG_LAYER_DEL;
+                    response.canvas_id = client_canvas_id;
+                    response.layer_count = room->layers.size();
+                    response.layer_id = msg.layer_id;
+                    
+                    // Broadcast to ALL clients on this canvas (including sender for confirmation)
+                    for (int sock : room->tcp_clients) {
+                        write(sock, &response, sizeof(TCPMessage));
+                    }
+                    printf("[Server][TCP] Broadcast LAYER_DEL to %zu clients (layers=%d)\n", 
+                           room->tcp_clients.size(), response.layer_count);
+                    
+                    pthread_mutex_unlock(&room->mutex);
+                }
+                break;
+                
+            case MSG_LAYER_SYNC:
+                printf("[Server][TCP] LAYER_SYNC request: layer=%d\n", msg.layer_id);
+                if (client_canvas_id >= 0) {
+                    CanvasRoom* room = get_or_create_canvas(client_canvas_id);
+                    pthread_mutex_lock(&room->mutex);
+                    
+                    int layer_idx = msg.layer_id;
+                    if (layer_idx > 0 && layer_idx < (int)room->layers.size()) {
+                        // Receive layer data from client
+                        size_t layer_size = WIDTH * HEIGHT * 4;
+                        uint8_t* layer_data = new uint8_t[layer_size];
+                        size_t received = 0;
+                        while (received < layer_size) {
+                            ssize_t n = recv(client_sock, layer_data + received, layer_size - received, 0);
+                            if (n <= 0) break;
+                            received += n;
+                        }
+                        
+                        if (received == layer_size) {
+                            // Update server's layer
+                            Layer* layer = room->layers[layer_idx];
+                            for (int x = 0; x < WIDTH; x++) {
+                                for (int y = 0; y < HEIGHT; y++) {
+                                    int idx = (y * WIDTH + x) * 4;
+                                    layer->pixels[x][y].r = layer_data[idx];
+                                    layer->pixels[x][y].g = layer_data[idx + 1];
+                                    layer->pixels[x][y].b = layer_data[idx + 2];
+                                    layer->pixels[x][y].a = layer_data[idx + 3];
+                                }
+                            }
+                            printf("[Server][TCP] Received layer %d data (%zu bytes)\n", layer_idx, received);
+                            
+                            // Broadcast to other clients
+                            TCPMessage broadcast;
+                            memset(&broadcast, 0, sizeof(broadcast));
+                            broadcast.type = MSG_LAYER_SYNC;
+                            broadcast.canvas_id = client_canvas_id;
+                            broadcast.layer_id = layer_idx;
+                            broadcast.layer_count = room->layers.size();
+                            
+                            for (int sock : room->tcp_clients) {
+                                if (sock != client_sock) {  // Don't send back to sender
+                                    write(sock, &broadcast, sizeof(TCPMessage));
+                                    write(sock, layer_data, layer_size);
+                                }
+                            }
+                            printf("[Server][TCP] Broadcast LAYER_SYNC to %zu other clients\n", 
+                                   room->tcp_clients.size() - 1);
+                        }
+                        delete[] layer_data;
+                    }
+                    
+                    pthread_mutex_unlock(&room->mutex);
+                }
+                break;
+        }
+    }
+
+    if (client_canvas_id >= 0) {
+        CanvasRoom* room = get_or_create_canvas(client_canvas_id);
+        pthread_mutex_lock(&room->mutex);
+        auto& clients = room->tcp_clients;
+        clients.erase(remove(clients.begin(), clients.end(), client_sock), clients.end());
+        printf("[Server][TCP] Removed socket %d from canvas #%d\n", client_sock, client_canvas_id);
+        pthread_mutex_unlock(&room->mutex);
+    }
+    
+    close(client_sock);
+    printf("[Server][TCP] ===== Socket %d closed =====\n", client_sock);
+    return NULL;
+}
+
+/* ============================================================================
+   MAIN
+   ============================================================================ */
 
 int main() {
-    init_canvas();
+    printf("============================================\n");
+    printf("  Shared Canvas Server v4.0\n");
+    printf("  Multi-Layer + On-Demand Canvases\n");
+    printf("============================================\n\n");
     
-    // Initialize Brushes
+    printf("[Server][Init] On-demand canvas system ready\n");
+    
+    load_all_canvases();
+    
     availableBrushes.push_back(new RoundBrush());
     availableBrushes.push_back(new SquareBrush());
+    availableBrushes.push_back(new HardEraserBrush());
+    printf("[Server][Init] Loaded %zu brushes\n", availableBrushes.size());
 
-    // 1. Setup TCP Socket
+    printf("[Server][Init] Setting up TCP on port %d...\n", PORT);
     int tcp_sd = socket(AF_INET, SOCK_STREAM, 0);
-    if (tcp_sd == -1) { perror("TCP socket"); return 1; }
+    if (tcp_sd == -1) { perror("[Server] TCP socket"); return 1; }
     
     int on = 1;
     setsockopt(tcp_sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
@@ -337,37 +960,35 @@ int main() {
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     server_addr.sin_port = htons(PORT);
     
-    if (bind(tcp_sd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) { perror("TCP bind"); return 1; }
-    if (listen(tcp_sd, 5) == -1) { perror("TCP listen"); return 1; }
+    if (bind(tcp_sd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+        perror("[Server] TCP bind"); return 1;
+    }
+    if (listen(tcp_sd, 5) == -1) { perror("[Server] TCP listen"); return 1; }
 
-    // 2. Setup UDP Socket
-    udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
-    if (udp_socket == -1) { perror("UDP socket"); return 1; }
-    
-    // Bind UDP to the same port (or different, but same is fine for different protocols)
-    if (bind(udp_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) { perror("UDP bind"); return 1; }
+    printf("\n[Server] ===== SERVER READY =====\n");
+    printf("[Server] TCP: %d | UDP: %d+ (on-demand) | Layers: %d\n", 
+           PORT, PORT+1, MAX_LAYERS);
+    printf("==========================================\n\n");
 
-    printf("[Server] Listening on TCP/UDP port %d...\n", PORT);
+    pthread_t save_th;
+    pthread_create(&save_th, NULL, autosave_thread, NULL);
 
-    // 3. Start UDP Listener Thread
-    pthread_t udp_th;
-    pthread_create(&udp_th, NULL, &udp_listener_thread, NULL);
-
-    // 4. Accept TCP Connections
+    printf("[Server] Waiting for connections...\n\n");
     while (1) {
         struct sockaddr_in from;
         socklen_t length = sizeof(from);
         
-        int client = accept(tcp_sd, (struct sockaddr *)&from, &length);
-        if (client < 0) {
-            perror("Accept error");
-            continue;
-        }
+        int client = accept(tcp_sd, (struct sockaddr*)&from, &length);
+        if (client < 0) { perror("[Server] Accept"); continue; }
+        
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &from.sin_addr, client_ip, INET_ADDRSTRLEN);
+        printf("[Server] New connection: %s:%d (socket=%d)\n", client_ip, ntohs(from.sin_port), client);
 
         int* arg = (int*)malloc(sizeof(int));
         *arg = client;
         
         pthread_t tcp_th;
-        pthread_create(&tcp_th, NULL, &tcp_client_session, arg);
+        pthread_create(&tcp_th, NULL, tcp_client_session, arg);
     }
 }
