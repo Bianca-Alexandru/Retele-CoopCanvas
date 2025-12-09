@@ -1,12 +1,16 @@
 #ifndef BRUSHES_H
 #define BRUSHES_H
 
-#include <SDL2/SDL.h>
+#ifdef SERVER_SIDE
+    #include <cstdint>
+    struct Pixel { uint8_t r, g, b, a; };
+#else
+    #include <SDL2/SDL.h>
+    typedef SDL_Color Pixel;
+#endif
+
 #include <functional>
 #include <cmath>
-
-// Common typedef used in both server and client
-typedef SDL_Color Pixel;
 
 // Abstract Base Class for Brushes
 class Brush {

@@ -41,10 +41,14 @@ extern map<string, RemoteCursor> remote_cursors;
 
 extern void send_tcp_login(const char* username);
 extern void send_tcp_save();
-extern void send_tcp_add_layer();
+extern void send_tcp_add_layer(int layer_id = 0);
 extern void send_tcp_delete_layer(int layer_id);
+extern void UpdateLayerButtons();
 extern void perform_undo();
 extern void perform_redo();
+extern void save_undo_state();
+extern void download_as_png();
+extern vector<CanvasSnapshot*> redoStack;
 
 #define UI_WIDTH 640
 #define UI_HEIGHT 480
@@ -260,7 +264,7 @@ public:
     
     virtual void Click() override {
         printf("[Client][UI] Login button clicked for canvas #%d\n", currentCanvasId);
-        send_tcp_login("User1");
+        send_tcp_login("username");  // Hardcoded username for now
     }
 };
 
@@ -369,6 +373,7 @@ public:
     
     virtual void Click() override {
         printf("[Client][UI] Add layer button clicked\n");
+        save_undo_state(); // Save state before adding
         send_tcp_add_layer();
         // layerCount will be updated when server broadcasts MSG_LAYER_ADD
     }
@@ -388,6 +393,7 @@ public:
     virtual void Click() override {
         if (layerCount > 2 && currentLayerId > 0) {
             printf("[Client][UI] Delete layer button clicked for layer %d\n", currentLayerId);
+            save_undo_state(); // Save state before deleting
             send_tcp_delete_layer(currentLayerId);
             // layerCount and currentLayerId will be updated when server broadcasts MSG_LAYER_DEL
         } else {
@@ -427,6 +433,8 @@ public:
 class RedoButton : public Button {
 public:
     virtual void Draw(SDL_Renderer* renderer) override {
+        if (redoStack.empty()) return; // Don't draw if nothing to redo
+
         SDL_SetRenderDrawColor(renderer, 80, 80, 120, 255);  // Blue-grey
         SDL_Rect rect = {x, y, w, h};
         SDL_RenderFillRect(renderer, &rect);
@@ -445,6 +453,28 @@ public:
     
     virtual void Click() override {
         perform_redo();
+    }
+};
+
+class DownloadButton : public Button {
+public:
+    virtual void Draw(SDL_Renderer* renderer) override {
+        SDL_SetRenderDrawColor(renderer, 150, 75, 0, 255);  // Brown
+        SDL_Rect rect = {x, y, w, h};
+        SDL_RenderFillRect(renderer, &rect);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+        SDL_Rect inner = {x+10, y+5, w-20, h-15};
+        SDL_RenderDrawRect(renderer, &inner);
+        // Draw downward arrow
+        int cx = x + w/2, cy = y + h/2;
+        SDL_RenderDrawLine(renderer, cx, cy - 5, cx, cy + 5);
+        SDL_RenderDrawLine(renderer, cx - 5, cy + 2, cx, cy + 5);
+        SDL_RenderDrawLine(renderer, cx + 5, cy + 2, cx, cy + 5);
+    }
+
+    virtual void Click() override {
+        download_as_png();
+        printf("[Client][UI] Download button clicked\n");
     }
 };
 
@@ -473,12 +503,12 @@ inline void draw_digit(SDL_Renderer* renderer, int digit, int x, int y, int size
    ============================================================================ */
 
 // Button indices
-#define SAVE_BTN_IDX 10
-#define ADD_LAYER_BTN_IDX 11
-#define DEL_LAYER_BTN_IDX 12
-#define UNDO_BTN_IDX 13
-#define REDO_BTN_IDX 14
-#define LAYER_BUTTONS_START 15
+#define SAVE_BTN_IDX 11
+#define ADD_LAYER_BTN_IDX 12
+#define DEL_LAYER_BTN_IDX 13
+#define UNDO_BTN_IDX 14
+#define REDO_BTN_IDX 15
+#define LAYER_BUTTONS_START 16
 
 inline void SetupUI() {
     printf("[Client][UI] Setting up UI buttons...\n");
@@ -519,6 +549,10 @@ inline void SetupUI() {
     SizeDownButton* sizeDown = new SizeDownButton(); sizeDown->x = 170; sizeDown->y = 50; sizeDown->w = 30; sizeDown->h = 30;
     buttons.push_back(sizeDown);
 
+    DownloadButton* downloadBtn = new DownloadButton();
+    downloadBtn->x = 170; downloadBtn->y = 90; downloadBtn->w = 30; downloadBtn->h = 30;
+    buttons.push_back(downloadBtn);
+
     // === SAVE BUTTON (index 10) - Top center ===
     SaveButton* saveBtn = new SaveButton();
     saveBtn->x = UI_WIDTH/2 - 25; saveBtn->y = 10; saveBtn->w = 50; saveBtn->h = 30;
@@ -546,18 +580,13 @@ inline void SetupUI() {
 
     // === LAYER BUTTONS (indices 15+) - Will be created dynamically ===
     // Initial layer buttons for layers 1-2
-    for (int i = 1; i <= 2; i++) {
-        LayerButton* lb = new LayerButton();
-        lb->x = UI_WIDTH - 45; lb->y = 40 + (i-1) * 35; lb->w = 35; lb->h = 30;
-        lb->layerId = i;
-        buttons.push_back(lb);
-    }
+    UpdateLayerButtons();
 
     printf("[Client][UI] UI setup complete: %zu buttons\n", buttons.size());
 }
 
 inline void UpdateLayerButtons() {
-    // Remove old layer buttons (keep indices 0-14)
+    // Remove old layer buttons (keep indices 0-15)
     while (buttons.size() > LAYER_BUTTONS_START) {
         delete buttons.back();
         buttons.pop_back();
@@ -600,24 +629,8 @@ inline void draw_ui(SDL_Renderer* renderer) {
 
     SDL_RenderCopy(renderer, canvasTexture, NULL, NULL);
 
-    // Draw tool buttons (indices 3-9)
-    for (size_t i = 3; i < 10 && i < buttons.size(); i++) {
-        buttons[i]->Draw(renderer);
-    }
-    
-    // Draw save button (index 10)
-    if (buttons.size() > SAVE_BTN_IDX) buttons[SAVE_BTN_IDX]->Draw(renderer);
-    
-    // Draw layer control buttons (indices 11-12)
-    if (buttons.size() > ADD_LAYER_BTN_IDX) buttons[ADD_LAYER_BTN_IDX]->Draw(renderer);
-    if (buttons.size() > DEL_LAYER_BTN_IDX) buttons[DEL_LAYER_BTN_IDX]->Draw(renderer);
-    
-    // Draw undo/redo buttons (indices 13-14)
-    if (buttons.size() > UNDO_BTN_IDX) buttons[UNDO_BTN_IDX]->Draw(renderer);
-    if (buttons.size() > REDO_BTN_IDX) buttons[REDO_BTN_IDX]->Draw(renderer);
-    
-    // Draw layer buttons (indices 15+)
-    for (size_t i = LAYER_BUTTONS_START; i < buttons.size(); i++) {
+    // Draw all canvas UI buttons (tools, save, layer controls, undo/redo, layers)
+    for (size_t i = 3; i < buttons.size(); i++) {
         buttons[i]->Draw(renderer);
     }
 
@@ -645,45 +658,24 @@ inline bool handle_login_screen_click(int x, int y) {
     return false;
 }
 
+// Helper: Check if point is inside button
+inline bool point_in_button(Button* btn, int x, int y) {
+    return x >= btn->x && x < btn->x + btn->w && y >= btn->y && y < btn->y + btn->h;
+}
+
 inline bool handle_canvas_ui_click(int x, int y) {
-    // Check tool buttons (3-9)
-    for (size_t i = 3; i < 10 && i < buttons.size(); i++) {
+    // Iterate through all canvas UI buttons (indices 3+)
+    for (size_t i = 3; i < buttons.size(); i++) {
         Button* btn = buttons[i];
-        if (x >= btn->x && x < btn->x + btn->w && y >= btn->y && y < btn->y + btn->h) {
+        // Special check for Redo button visibility
+        if (i == REDO_BTN_IDX && redoStack.empty()) continue;
+
+        if (point_in_button(btn, x, y)) {
             btn->Click();
-            return true;
-        }
-    }
-    // Check save button (10)
-    if (buttons.size() > SAVE_BTN_IDX) {
-        Button* btn = buttons[SAVE_BTN_IDX];
-        if (x >= btn->x && x < btn->x + btn->w && y >= btn->y && y < btn->y + btn->h) {
-            btn->Click();
-            return true;
-        }
-    }
-    // Check layer control buttons (11-12)
-    for (size_t i = ADD_LAYER_BTN_IDX; i <= DEL_LAYER_BTN_IDX && i < buttons.size(); i++) {
-        Button* btn = buttons[i];
-        if (x >= btn->x && x < btn->x + btn->w && y >= btn->y && y < btn->y + btn->h) {
-            btn->Click();
-            UpdateLayerButtons();
-            return true;
-        }
-    }
-    // Check undo/redo buttons (13-14)
-    for (size_t i = UNDO_BTN_IDX; i <= REDO_BTN_IDX && i < buttons.size(); i++) {
-        Button* btn = buttons[i];
-        if (x >= btn->x && x < btn->x + btn->w && y >= btn->y && y < btn->y + btn->h) {
-            btn->Click();
-            return true;
-        }
-    }
-    // Check layer buttons (15+)
-    for (size_t i = LAYER_BUTTONS_START; i < buttons.size(); i++) {
-        Button* btn = buttons[i];
-        if (x >= btn->x && x < btn->x + btn->w && y >= btn->y && y < btn->y + btn->h) {
-            btn->Click();
+            // Layer add/delete buttons need UI refresh
+            if (i == ADD_LAYER_BTN_IDX || i == DEL_LAYER_BTN_IDX) {
+                UpdateLayerButtons();
+            }
             return true;
         }
     }

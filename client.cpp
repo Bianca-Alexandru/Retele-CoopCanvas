@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <ctime>
 #include <string>
 #include <vector>
 #include <map>
@@ -52,7 +53,7 @@ enum MsgType {
     MSG_LAYER_ADD = 10,
     MSG_LAYER_DEL = 11,
     MSG_LAYER_SELECT = 12,
-    MSG_LAYER_SYNC = 13  // Full layer data sync (for undo/redo)
+    MSG_LAYER_SYNC = 13   // Full layer data sync (for undo/redo)
 };
 
 struct TCPMessage {
@@ -73,6 +74,7 @@ struct UDPMessage {
     int16_t  ex, ey;  // for line drawing
     uint8_t  r, g, b, a;
     uint8_t  size;
+    uint8_t  pressure;  // 0-255 representing 0.0-1.0 pressure (for pen tablets)
 } __attribute__((packed));
 
 /* ============================================================================
@@ -108,6 +110,10 @@ pthread_mutex_t layerMutex = PTHREAD_MUTEX_INITIALIZER;  // Protects layers arra
 // Flag for pending UI updates (set by TCP thread, handled by main thread)
 volatile bool pendingLayerUpdate = false;
 
+// Flags to prevent double-application of layer ops during Undo/Redo
+volatile int ignore_layer_add = 0;
+volatile int ignore_layer_del = 0;
+
 // Undo/Redo system - stores snapshots of layers
 struct CanvasSnapshot {
     uint8_t* data[MAX_LAYERS];
@@ -137,8 +143,21 @@ struct CanvasSnapshot {
     
     void restore() {
         for (int i = 0; i < MAX_LAYERS; i++) {
-            if (data[i] && layers[i]) {
+            if (data[i]) {
+                // Snapshot has data for this layer
+                if (!layers[i]) {
+                    // Allocate if missing
+                    layers[i] = new uint8_t[CANVAS_WIDTH * CANVAS_HEIGHT * 4];
+                }
+                // Copy data
                 memcpy(layers[i], data[i], CANVAS_WIDTH * CANVAS_HEIGHT * 4);
+            } else {
+                // Snapshot has no data for this layer
+                if (layers[i]) {
+                    // If we have a layer but snapshot doesn't, delete it
+                    delete[] layers[i];
+                    layers[i] = nullptr;
+                }
             }
         }
         ::layerCount = layerCount;
@@ -171,7 +190,7 @@ vector<Button*> buttons;
 
 void send_tcp_login(const char* username);
 void send_tcp_save();
-void send_tcp_add_layer();
+void send_tcp_add_layer(int layer_id);
 void send_tcp_delete_layer(int layer_id);
 void send_tcp_layer_sync(int layer_id);
 void send_all_layers_sync();
@@ -264,87 +283,68 @@ void send_tcp_login(const char* username) {
     printf("[Client][TCP] Login request sent\n");
 }
 
-void send_tcp_save() {
-    if (tcpSock < 0) return;
-    
-    printf("[Client][TCP] Sending save request...\n");
+// Generalized TCP message sender
+bool send_tcp(int type, int layer_id = 0, const char* extra_data = nullptr, size_t extra_len = 0) {
+    if (tcpSock < 0) return false;
     
     TCPMessage msg;
     memset(&msg, 0, sizeof(msg));
-    msg.type = MSG_SAVE;
+    msg.type = type;
     msg.canvas_id = currentCanvasId;
+    msg.layer_id = layer_id;
     msg.data_len = 0;
-
+    
     if (send(tcpSock, &msg, sizeof(msg), 0) < 0) {
-        perror("[Client][TCP] Save send failed");
-    } else {
+        perror("[Client][TCP] Send failed");
+        return false;
+    }
+    
+    // Send extra data if provided
+    if (extra_data && extra_len > 0) {
+        size_t total_sent = 0;
+        while (total_sent < extra_len) {
+            ssize_t sent = send(tcpSock, extra_data + total_sent, extra_len - total_sent, 0);
+            if (sent < 0) {
+                perror("[Client][TCP] Extra data send failed");
+                return false;
+            }
+            total_sent += sent;
+        }
+    }
+    
+    return true;
+}
+
+void send_tcp_save() {
+    printf("[Client][TCP] Sending save request...\n");
+    if (send_tcp(MSG_SAVE)) {
         printf("[Client][TCP] Save request sent\n");
     }
 }
 
-void send_tcp_add_layer() {
-    if (tcpSock < 0) return;
-    
-    printf("[Client][TCP] Sending add layer request...\n");
-    
-    TCPMessage msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.type = MSG_LAYER_ADD;
-    msg.canvas_id = currentCanvasId;
-    msg.data_len = 0;
-
-    if (send(tcpSock, &msg, sizeof(msg), 0) < 0) {
-        perror("[Client][TCP] Add layer send failed");
-    } else {
+void send_tcp_add_layer(int layer_id) {
+    printf("[Client][TCP] Sending add layer request: layer=%d\n", layer_id);
+    if (send_tcp(MSG_LAYER_ADD, layer_id)) {
         printf("[Client][TCP] Add layer request sent\n");
     }
 }
 
 void send_tcp_delete_layer(int layer_id) {
-    if (tcpSock < 0) return;
-    
     printf("[Client][TCP] Sending delete layer request: layer=%d\n", layer_id);
-    
-    TCPMessage msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.type = MSG_LAYER_DEL;
-    msg.canvas_id = currentCanvasId;
-    msg.layer_id = layer_id;
-    msg.data_len = 0;
-
-    if (send(tcpSock, &msg, sizeof(msg), 0) < 0) {
-        perror("[Client][TCP] Delete layer send failed");
-    } else {
+    if (send_tcp(MSG_LAYER_DEL, layer_id)) {
         printf("[Client][TCP] Delete layer request sent\n");
     }
 }
 
 void send_tcp_layer_sync(int layer_id) {
-    if (tcpSock < 0) return;
     if (layer_id <= 0 || layer_id >= MAX_LAYERS || !layers[layer_id]) return;
     
     printf("[Client][TCP] Sending layer sync: layer=%d\n", layer_id);
     
-    TCPMessage msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.type = MSG_LAYER_SYNC;
-    msg.canvas_id = currentCanvasId;
-    msg.layer_id = layer_id;
-    msg.data_len = 0;
-
-    if (send(tcpSock, &msg, sizeof(msg), 0) < 0) {
-        perror("[Client][TCP] Layer sync header send failed");
-        return;
-    }
-    
-    // Send full layer data
     size_t layer_size = CANVAS_WIDTH * CANVAS_HEIGHT * 4;
-    if (send(tcpSock, layers[layer_id], layer_size, 0) < 0) {
-        perror("[Client][TCP] Layer sync data send failed");
-        return;
+    if (send_tcp(MSG_LAYER_SYNC, layer_id, (const char*)layers[layer_id], layer_size)) {
+        printf("[Client][TCP] Layer sync sent (%zu bytes)\n", layer_size);
     }
-    
-    printf("[Client][TCP] Layer sync sent (%zu bytes)\n", layer_size);
 }
 
 void send_all_layers_sync() {
@@ -380,6 +380,7 @@ void send_udp_draw(int x, int y) {
     pkt.b = userColor.b;
     pkt.a = userColor.a;
     pkt.size = (currentBrushId < (int)availableBrushes.size()) ? availableBrushes[currentBrushId]->size : 5;
+    pkt.pressure = 255;  // Full pressure (1.0), will be dynamic with pen tablet support
 
     sendto(udpSock, &pkt, sizeof(pkt), 0, (struct sockaddr*)&serverUdpAddr, sizeof(serverUdpAddr));
     
@@ -412,6 +413,7 @@ void send_udp_cursor(int x, int y) {
     pkt.g = userColor.g;
     pkt.b = userColor.b;
     pkt.a = 255;
+    pkt.pressure = 255;  // Full pressure for cursor
 
     sendto(udpSock, &pkt, sizeof(pkt), 0, (struct sockaddr*)&serverUdpAddr, sizeof(serverUdpAddr));
 }
@@ -430,7 +432,8 @@ void* tcp_receiver_thread(void* arg) {
         ssize_t n = recv(tcpSock, &msg, sizeof(msg), 0);
         if (n <= 0) {
             if (running) {
-                printf("[Client][TCP-Thread] Connection closed or error\n");
+                printf("[Client][TCP-Thread] Connection closed or error. Shutting down.\n");
+                running = 0; // Signal main loop to exit
             }
             break;
         }
@@ -498,11 +501,18 @@ void* tcp_receiver_thread(void* arg) {
             case MSG_LAYER_ADD:
                 printf("[Client][TCP-Thread] LAYER_ADD confirmed: new layer count=%d\n", msg.layer_count);
                 pthread_mutex_lock(&layerMutex);
-                layerCount = msg.layer_count;
-                // Create the new layer locally
-                if (layerCount > 1 && layerCount <= MAX_LAYERS && !layers[layerCount - 1]) {
-                    init_layer(layerCount - 1, false);
-                    printf("[Client][TCP-Thread] Created layer %d locally\n", layerCount - 1);
+                
+                if (ignore_layer_add > 0) {
+                    printf("[Client][TCP-Thread] Ignoring LAYER_ADD (self-triggered via Undo/Redo)\n");
+                    ignore_layer_add--;
+                    layerCount = msg.layer_count;
+                } else {
+                    layerCount = msg.layer_count;
+                    // Create the new layer locally
+                    if (layerCount > 1 && layerCount <= MAX_LAYERS && !layers[layerCount - 1]) {
+                        init_layer(layerCount - 1, false);
+                        printf("[Client][TCP-Thread] Created layer %d locally\n", layerCount - 1);
+                    }
                 }
                 pendingLayerUpdate = true;  // Main thread will call UpdateLayerButtons()
                 pthread_mutex_unlock(&layerMutex);
@@ -512,21 +522,29 @@ void* tcp_receiver_thread(void* arg) {
                 printf("[Client][TCP-Thread] LAYER_DEL confirmed: deleted layer %d, new count=%d\n", 
                        msg.layer_id, msg.layer_count);
                 pthread_mutex_lock(&layerMutex);
-                // Delete local layer and shift remaining layers down
-                if (msg.layer_id > 0 && msg.layer_id < MAX_LAYERS) {
-                    // Delete the layer
-                    if (layers[msg.layer_id]) {
-                        delete[] layers[msg.layer_id];
-                        layers[msg.layer_id] = nullptr;
+                
+                if (ignore_layer_del > 0) {
+                    printf("[Client][TCP-Thread] Ignoring LAYER_DEL (self-triggered via Undo/Redo)\n");
+                    ignore_layer_del--;
+                    layerCount = msg.layer_count;
+                } else {
+                    // Delete local layer and shift remaining layers down
+                    if (msg.layer_id > 0 && msg.layer_id < MAX_LAYERS) {
+                        // Delete the layer
+                        if (layers[msg.layer_id]) {
+                            delete[] layers[msg.layer_id];
+                            layers[msg.layer_id] = nullptr;
+                        }
+                        // Shift all layers above down by one
+                        for (int l = msg.layer_id; l < MAX_LAYERS - 1; l++) {
+                            layers[l] = layers[l + 1];
+                        }
+                        layers[MAX_LAYERS - 1] = nullptr;
+                        printf("[Client][TCP-Thread] Shifted layers down after deleting layer %d\n", msg.layer_id);
                     }
-                    // Shift all layers above down by one
-                    for (int l = msg.layer_id; l < MAX_LAYERS - 1; l++) {
-                        layers[l] = layers[l + 1];
-                    }
-                    layers[MAX_LAYERS - 1] = nullptr;
-                    printf("[Client][TCP-Thread] Shifted layers down after deleting layer %d\n", msg.layer_id);
+                    layerCount = msg.layer_count;
                 }
-                layerCount = msg.layer_count;
+                
                 if (currentLayerId >= layerCount) currentLayerId = layerCount - 1;
                 if (currentLayerId < 1) currentLayerId = 1;
                 pendingLayerUpdate = true;  // Main thread will call UpdateLayerButtons()
@@ -698,14 +716,47 @@ void perform_undo() {
     redoSnap->capture();
     redoStack.push_back(redoSnap);
     
+    // Capture current layer count before restore
+    int oldLayerCount = layerCount;
+
     // Restore from undo stack
     CanvasSnapshot* undoSnap = undoStack.back();
     undoStack.pop_back();
     undoSnap->restore();
+    
+    // Check for layer count mismatch (deleted or added layers)
+    if (layerCount > oldLayerCount) {
+        // Layers were restored (undoing a deletion)
+        // We need to tell the server to add these layers back
+        for (int i = oldLayerCount; i < layerCount; i++) {
+            printf("[Client][Undo] Restoring deleted layer %d\n", i);
+            ignore_layer_add++;
+            send_tcp_add_layer();
+            // Small delay to ensure server processes ADD before SYNC
+            usleep(50000); 
+        }
+    } else if (layerCount < oldLayerCount) {
+        // Layers were removed (undoing an addition)
+        // We need to tell the server to delete these layers
+        // Delete from top down to avoid index shifting issues
+        for (int i = oldLayerCount - 1; i >= layerCount; i--) {
+            printf("[Client][Undo] Removing added layer %d\n", i);
+            ignore_layer_del++;
+            send_tcp_delete_layer(i);
+            usleep(50000);
+        }
+    }
+
     delete undoSnap;
     
     // Sync changes to other clients
     send_all_layers_sync();
+    
+    // Clamp currentLayerId to valid range
+    if (currentLayerId >= layerCount) currentLayerId = layerCount - 1;
+    if (currentLayerId < 1 && layerCount > 1) currentLayerId = 1;
+    
+    pendingLayerUpdate = true;
     
     printf("[Client][Undo] Undo performed (undo stack: %zu, redo stack: %zu)\n", 
            undoStack.size(), redoStack.size());
@@ -722,14 +773,46 @@ void perform_redo() {
     undoSnap->capture();
     undoStack.push_back(undoSnap);
     
+    // Capture current layer count before restore
+    int oldLayerCount = layerCount;
+
     // Restore from redo stack
     CanvasSnapshot* redoSnap = redoStack.back();
     redoStack.pop_back();
     redoSnap->restore();
+
+    // Check for layer count mismatch
+    if (layerCount > oldLayerCount) {
+        // Layers were restored (redoing an addition)
+        for (int i = oldLayerCount; i < layerCount; i++) {
+            printf("[Client][Redo] Restoring added layer %d\n", i);
+            ignore_layer_add++;
+            send_tcp_add_layer();
+            usleep(50000);
+        }
+    } else if (layerCount < oldLayerCount) {
+        // Layers were removed (redoing a deletion)
+        // Delete from top down to avoid index shifting issues
+        for (int i = oldLayerCount - 1; i >= layerCount; i--) {
+            printf("[Client][Redo] Removing deleted layer %d\n", i);
+            ignore_layer_del++;
+            send_tcp_delete_layer(i);
+            usleep(50000);
+        }
+    }
+
     delete redoSnap;
     
     // Sync changes to other clients
     send_all_layers_sync();
+    
+    // Clamp currentLayerId to valid range
+    if (currentLayerId >= layerCount) currentLayerId = layerCount - 1;
+    if (currentLayerId < 1 && layerCount > 1) currentLayerId = 1;
+    
+    // Force UI update immediately to remove deleted layer buttons
+    pendingLayerUpdate = true;
+    UpdateLayerButtons();
     
     printf("[Client][Redo] Redo performed (undo stack: %zu, redo stack: %zu)\n", 
            undoStack.size(), redoStack.size());
@@ -800,6 +883,47 @@ void update_canvas_texture() {
     
     composite_layers();
     SDL_UpdateTexture(canvasTexture, NULL, compositeCanvas, CANVAS_WIDTH * 4);
+}
+
+void download_as_png() {
+    // Save the flattened canvas as a BMP file locally
+    printf("[Client][Download] Saving canvas as BMP...\n");
+    
+    if (!compositeCanvas) {
+        printf("[Client][Download] ERROR: No canvas data to save\n");
+        return;
+    }
+    
+    // Generate filename with timestamp
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    char filename[128];
+    snprintf(filename, sizeof(filename), "canvas_%04d%02d%02d_%02d%02d%02d.bmp",
+             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+             t->tm_hour, t->tm_min, t->tm_sec);
+    
+    // Create SDL surface from composite canvas (RGBA format)
+    SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormatFrom(
+        compositeCanvas,
+        CANVAS_WIDTH, CANVAS_HEIGHT,
+        32,                           // bits per pixel
+        CANVAS_WIDTH * 4,             // pitch (bytes per row)
+        SDL_PIXELFORMAT_RGBA32
+    );
+    
+    if (!surface) {
+        printf("[Client][Download] ERROR: Failed to create surface: %s\n", SDL_GetError());
+        return;
+    }
+    
+    // Save as BMP
+    if (SDL_SaveBMP(surface, filename) == 0) {
+        printf("[Client][Download] Saved canvas to: %s\n", filename);
+    } else {
+        printf("[Client][Download] ERROR: Failed to save BMP: %s\n", SDL_GetError());
+    }
+    
+    SDL_FreeSurface(surface);
 }
 
 /* ============================================================================
