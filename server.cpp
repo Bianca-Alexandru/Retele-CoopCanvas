@@ -1,23 +1,13 @@
 /* 
-   TCP/UDP Hybrid Server - Shared Canvas
-   Multi-Canvas with Per-Canvas Thread Architecture + Multi-Layer Support
+   COOP CANVAS SERVER TLDR
    
-   Architecture:
-   - Main thread: Accepts TCP connections, handles login, routes clients to canvas threads
-   - Canvas threads: One per active canvas, handles all UDP for that canvas
-   - Autosave thread: Periodically saves all active canvases
-   
-   Layer System:
-   - Layer 0: White paper background (not stored, always white)
-   - Layer 1+: Transparent layers where users draw (stored in JSON)
-   
-   Protocol:
-   - TCP: Login (with canvas_id), Save, Layer operations
-   - UDP: Draw, Line, Cursor (no canvas_id needed - each canvas has its own UDP port)
-   
-   Port Scheme:
-   - Base port (6769): TCP connections
-   - Base + canvas_id + 1: UDP for each canvas (6770, 6771, etc.)
+   -Main thread accepts TCP connections and routes clients
+   -One thread per active canvas handles UDP traffic
+   -Autosave thread periodically saves all canvases
+   -Layer 0 is white background, Layer 1+ are transparent user layers
+   -TCP used for Login, Save, Layer ops
+   -UDP used for Draw, Line, Cursor
+   -TCP port at 6769, UDP ports start at 6770 + canvasID
 */
 
 #include <sys/types.h>
@@ -51,9 +41,9 @@ using namespace std;
 
 extern int errno;
 
-/* ============================================================================
+/* ****************************************************************************
    PROTOCOL STRUCTURES
-   ============================================================================ */
+   **************************************************************************** */
 
 enum MsgType {
     MSG_LOGIN = 1,
@@ -94,9 +84,9 @@ struct UDPMessage {
     uint8_t  pressure;  // 0-255 representing 0.0-1.0 pressure (for pen tablets)
 } __attribute__((packed));
 
-/* ============================================================================
+/*****************************************************************************
    LAYER STRUCTURE
-   ============================================================================ */
+ *****************************************************************************/
 
 struct Layer {
     Pixel pixels[WIDTH][HEIGHT];
@@ -118,9 +108,9 @@ struct Layer {
     }
 };
 
-/* ============================================================================
+/*****************************************************************************
    CANVAS ROOM STRUCTURE
-   ============================================================================ */
+ *****************************************************************************/
 
 struct CanvasRoom {
     int id;
@@ -222,9 +212,9 @@ struct CanvasRoom {
     }
 };
 
-/* ============================================================================
+/*****************************************************************************
    GLOBAL STATE
-   ============================================================================ */
+ *****************************************************************************/
 
 map<int, CanvasRoom*> canvases;  // On-demand canvas creation
 pthread_mutex_t canvases_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -233,9 +223,9 @@ vector<Brush*> availableBrushes;
 // Track drawing state per client for less spammy logs
 map<string, bool> client_drawing;
 
-/* ============================================================================
+/*****************************************************************************
    HELPER FUNCTIONS
-   ============================================================================ */
+ *****************************************************************************/
 
 bool is_same_address(struct sockaddr_in a, struct sockaddr_in b) {
     return (a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port);
@@ -271,9 +261,9 @@ void broadcast_tcp(CanvasRoom* room, const TCPMessage& msg, int exclude_sock = -
 // Forward declaration
 CanvasRoom* get_or_create_canvas(int canvas_id);
 
-/* ============================================================================
+/*****************************************************************************
    UDP MESSAGE HANDLERS
-   ============================================================================ */
+ *****************************************************************************/
 
 // Broadcast UDP message to all clients except sender
 int broadcast_udp(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& sender_addr) {
@@ -369,9 +359,9 @@ void handle_line(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& sen
     printf("[Server][Canvas %d][UDP] LINE broadcast to %d clients\n", canvas_id, bc);
 }
 
-/* ============================================================================
+/*****************************************************************************
    CANVAS UDP THREAD
-   ============================================================================ */
+ *****************************************************************************/
 
 void* canvas_udp_thread(void* arg) {
     int canvas_id = *((int*)arg);
@@ -429,9 +419,9 @@ void* canvas_udp_thread(void* arg) {
     return NULL;
 }
 
-/* ============================================================================
+/*****************************************************************************
    START/STOP CANVAS THREAD
-   ============================================================================ */
+ *****************************************************************************/
 
 CanvasRoom* get_or_create_canvas(int canvas_id) {
     pthread_mutex_lock(&canvases_mutex);
@@ -496,9 +486,9 @@ bool start_canvas_thread(int canvas_id) {
     return true;
 }
 
-/* ============================================================================
+/*****************************************************************************
    PERSISTENCE - Single canvas.json with all canvases and layers
-   ============================================================================ */
+ *****************************************************************************/
 
 static const string b64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -654,7 +644,10 @@ void load_all_canvases() {
     
     FILE* f = fopen("canvas.json", "r");
     if (!f) {
-        printf("[Server][Load] No canvas.json found - starting fresh\n");
+        printf("[Server][Load] No canvas.json found - creating default...\n");
+        // Create a default canvas if none exists
+        CanvasRoom* room = get_or_create_canvas(0);
+        save_all_canvases();
         return;
     }
     
@@ -688,13 +681,16 @@ void load_all_canvases() {
         size_t layers_start = json.find("\"layers\":", pos);
         if (layers_start == string::npos) { pos++; continue; }
         
-        size_t canvas_end = json.find("}]", layers_start);
-        if (canvas_end == string::npos) canvas_end = json.size();
+        size_t layers_array_start = json.find("[", layers_start);
+        if (layers_array_start == string::npos) { pos++; continue; }
+
+        size_t layers_array_end = json.find("]", layers_array_start);
+        if (layers_array_end == string::npos) layers_array_end = json.size();
         
-        size_t layer_pos = layers_start;
+        size_t layer_pos = layers_array_start;
         int layer_count = 0;
         
-        while ((layer_pos = json.find("\"data\":", layer_pos)) != string::npos && layer_pos < canvas_end) {
+        while ((layer_pos = json.find("\"data\":", layer_pos)) != string::npos && layer_pos < layers_array_end) {
             size_t data_start = json.find("\"", layer_pos + 7);
             if (data_start == string::npos) break;
             data_start++;
@@ -724,9 +720,9 @@ void load_all_canvases() {
     printf("[Server][Load] ========== LOAD COMPLETE ==========\n\n");
 }
 
-/* ============================================================================
+/*****************************************************************************
    AUTOSAVE THREAD
-   ============================================================================ */
+ *****************************************************************************/
 
 void* autosave_thread(void* arg) {
     printf("[Server][Autosave] Thread started (interval: 60s)\n");
@@ -740,9 +736,9 @@ void* autosave_thread(void* arg) {
     return NULL;
 }
 
-/* ============================================================================
+/*****************************************************************************
    TCP SESSION HANDLER
-   ============================================================================ */
+ *****************************************************************************/
 
 void send_canvas_to_client(int sock, int canvas_id) {
     CanvasRoom* room = get_or_create_canvas(canvas_id);
@@ -976,9 +972,9 @@ void* tcp_client_session(void* arg) {
     return NULL;
 }
 
-/* ============================================================================
+/*****************************************************************************
    MAIN
-   ============================================================================ */
+ *****************************************************************************/
 
 int main() {
     printf("============================================\n");

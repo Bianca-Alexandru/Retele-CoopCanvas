@@ -1,7 +1,7 @@
 #ifndef BRUSHES_H
 #define BRUSHES_H
 
-#ifdef SERVER_SIDE
+#ifdef SERVER_SIDE  //server used to use sdl2 too only for SDL_color but the uni server said no :C
     #include <cstdint>
     struct Pixel { uint8_t r, g, b, a; };
 #else
@@ -12,7 +12,8 @@
 #include <functional>
 #include <cmath>
 
-// Abstract Base Class for Brushes
+// Abstract base class for Brushes
+// Will add way more in the final version
 class Brush {
 public:
     int size = 5;

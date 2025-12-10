@@ -1,15 +1,11 @@
 /*
-   Shared Canvas Client
+   COOP CANVAS CLIENT TLDR
    
-   Multi-layer drawing client with SDL2 UI.
-   Connects to server via TCP for control and UDP for canvas updates.
-   
-   Features:
-   - Multi-canvas lobby system
-   - Multi-layer support (layer 0 = white paper, layer 1+ = transparent)
-   - Multiple brush types
-   - Color picker with hue/saturation
-   - Real-time synchronization
+   -Thread for tcp and udp listening
+    -Main thread for UI and drawing
+    -Uses ui from ui.h and brushes from brushes.h
+    -Doesn't yet implement sdl text, everything is manually drawn for now
+    -TCP port at 6769 UDP port at 6770 + canvasID
 */
 
 #include <SDL2/SDL.h>
@@ -31,11 +27,11 @@ using namespace std;
 
 #include "brushes.h"
 
-/* ============================================================================
+/*****************************************************************************
    CONSTANTS AND TYPES
-   ============================================================================ */
+   *****************************************************************************/
 
-#define CANVAS_WIDTH  640
+#define CANVAS_WIDTH  640 //easy to change later
 #define CANVAS_HEIGHT 480
 #define TCP_PORT      6769
 #define UDP_BASE_PORT 6770
@@ -74,12 +70,12 @@ struct UDPMessage {
     int16_t  ex, ey;  // for line drawing
     uint8_t  r, g, b, a;
     uint8_t  size;
-    uint8_t  pressure;  // 0-255 representing 0.0-1.0 pressure (for pen tablets)
+    uint8_t  pressure;  // 0-255 representing 0.0-1.0 pressure 
 } __attribute__((packed));
 
-/* ============================================================================
+/*****************************************************************************
    GLOBAL STATE
-   ============================================================================ */
+ *****************************************************************************/
 
 // Connection
 int tcpSock = -1;
@@ -92,7 +88,7 @@ int currentCanvasId = 0;
 int currentLayerId = 1;  // Start on layer 1 (not layer 0 which is paper)
 int layerCount = 2;      // Layer 0 (paper) + Layer 1 (drawable)
 int loggedin = 0;
-int running = 1;
+volatile int running = 1;
 
 // Drawing
 SDL_Color userColor = {0, 0, 0, 255};
@@ -114,7 +110,9 @@ volatile bool pendingLayerUpdate = false;
 volatile int ignore_layer_add = 0;
 volatile int ignore_layer_del = 0;
 
-// Undo/Redo system - stores snapshots of layers
+// Undo/Redo system - stores snapshots of layers - will prob change later 
+// Undo/Redo + Layer system contributed 35% of wasted time and 60% of bugs </3 
+// Probably still has bugs leaving that for future me as a surprise :3
 struct CanvasSnapshot {
     uint8_t* data[MAX_LAYERS];
     int layerCount;
@@ -184,9 +182,9 @@ SDL_Texture* canvasTexture = nullptr;
 #include "ui.h"
 vector<Button*> buttons;
 
-/* ============================================================================
+/*****************************************************************************
    FORWARD DECLARATIONS
-   ============================================================================ */
+ *****************************************************************************/
 
 void send_tcp_login(const char* username);
 void send_tcp_save();
@@ -205,9 +203,9 @@ void perform_redo();
 // TCP thread handle
 pthread_t tcp_receiver_tid = 0;
 
-/* ============================================================================
+/*****************************************************************************
    NETWORK FUNCTIONS
-   ============================================================================ */
+ *****************************************************************************/
 
 int connect_tcp() {
     printf("[Client][TCP] Connecting to %s:%d...\n", serverIp, TCP_PORT);
@@ -380,11 +378,11 @@ void send_udp_draw(int x, int y) {
     pkt.b = userColor.b;
     pkt.a = userColor.a;
     pkt.size = (currentBrushId < (int)availableBrushes.size()) ? availableBrushes[currentBrushId]->size : 5;
-    pkt.pressure = 255;  // Full pressure (1.0), will be dynamic with pen tablet support
+    pkt.pressure = 255;  // Full pressure will change with pen tablet support
 
     sendto(udpSock, &pkt, sizeof(pkt), 0, (struct sockaddr*)&serverUdpAddr, sizeof(serverUdpAddr));
     
-    // Also apply locally to the correct layer for immediate feedback
+    // apply locally to the correct layer for immediate feedback
     if (currentBrushId < (int)availableBrushes.size()) {
         SDL_Color col = userColor;
         int layer_idx = currentLayerId;
@@ -413,14 +411,14 @@ void send_udp_cursor(int x, int y) {
     pkt.g = userColor.g;
     pkt.b = userColor.b;
     pkt.a = 255;
-    pkt.pressure = 255;  // Full pressure for cursor
+    pkt.pressure = 255;  // Full pressure doesnt really matter it's just cursor
 
     sendto(udpSock, &pkt, sizeof(pkt), 0, (struct sockaddr*)&serverUdpAddr, sizeof(serverUdpAddr));
 }
 
-/* ============================================================================
+/*****************************************************************************
    THREAD FUNCTIONS
-   ============================================================================ */
+ *****************************************************************************/
 
 void* tcp_receiver_thread(void* arg) {
     (void)arg;
@@ -434,6 +432,12 @@ void* tcp_receiver_thread(void* arg) {
             if (running) {
                 printf("[Client][TCP-Thread] Connection closed or error. Shutting down.\n");
                 running = 0; // Signal main loop to exit
+                
+                // Push a quit event to wake up the main loop if it's waiting
+                SDL_Event event;
+                event.type = SDL_QUIT;
+                event.quit.timestamp = SDL_GetTicks();
+                SDL_PushEvent(&event);
             }
             break;
         }
@@ -662,9 +666,9 @@ void* udp_receiver_thread(void* arg) {
     return NULL;
 }
 
-/* ============================================================================
+/*****************************************************************************
    DRAWING FUNCTIONS
-   ============================================================================ */
+ *****************************************************************************/
 
 void init_layer(int layer_idx, bool white) {
     if (layer_idx < 0 || layer_idx >= MAX_LAYERS) return;
@@ -885,7 +889,7 @@ void update_canvas_texture() {
     SDL_UpdateTexture(canvasTexture, NULL, compositeCanvas, CANVAS_WIDTH * 4);
 }
 
-void download_as_png() {
+void download_as_bmp() {
     // Save the flattened canvas as a BMP file locally
     printf("[Client][Download] Saving canvas as BMP...\n");
     
@@ -926,9 +930,9 @@ void download_as_png() {
     SDL_FreeSurface(surface);
 }
 
-/* ============================================================================
+/*****************************************************************************
    BRUSH INITIALIZATION
-   ============================================================================ */
+ *****************************************************************************/
 
 void init_brushes() {
     printf("[Client][Brushes] Initializing brush system...\n");
@@ -944,9 +948,9 @@ void init_brushes() {
     printf("[Client][Brushes] %zu brushes loaded\n", availableBrushes.size());
 }
 
-/* ============================================================================
+/*****************************************************************************
    SDL EVENT HANDLING
-   ============================================================================ */
+ *****************************************************************************/
 
 void handle_events() {
     SDL_Event e;
@@ -1069,9 +1073,9 @@ void handle_events() {
     }
 }
 
-/* ============================================================================
+/*****************************************************************************
    MAIN
-   ============================================================================ */
+ *****************************************************************************/
 
 int main(int argc, char* argv[]) {
     printf("[Client][Main] ==============================================\n");
