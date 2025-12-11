@@ -58,8 +58,14 @@ enum MsgType {
     MSG_LAYER_ADD = 10,
     MSG_LAYER_DEL = 11,
     MSG_LAYER_SELECT = 12,
-    MSG_LAYER_SYNC = 13   // Full layer data sync (for undo/redo)
+    MSG_LAYER_SYNC = 13,   // Full layer data sync (for undo/redo)
+    MSG_LAYER_REORDER = 14, // Swap layers
+    MSG_SIGNATURE = 15      // New signature message
 };
+
+#define SIGNATURE_WIDTH 256
+#define SIGNATURE_HEIGHT 128
+#define MAX_SIGNATURE_SIZE (SIGNATURE_WIDTH * SIGNATURE_HEIGHT)
 
 // TCP Message (packed for network)
 struct TCPMessage {
@@ -68,7 +74,18 @@ struct TCPMessage {
     uint16_t data_len;
     uint8_t  layer_count;
     uint8_t  layer_id;
-    char     data[256];
+    char     data[256]; // Reverted payload size
+} __attribute__((packed));
+
+// Specialized packet for login with signature
+struct LoginPacket {
+    uint8_t  type;        // MSG_LOGIN
+    uint8_t  canvas_id;
+    char     username[32];
+    uint16_t sig_width;
+    uint16_t sig_height;
+    uint32_t sig_len;
+    uint8_t  sig_data[MAX_SIGNATURE_SIZE]; // ~32KB
 } __attribute__((packed));
 
 // UDP Message (packed for network)
@@ -112,6 +129,21 @@ struct Layer {
    CANVAS ROOM STRUCTURE
  *****************************************************************************/
 
+struct ConnectedUser {
+    int socket_fd;
+    char username[32];
+    uint8_t* signature_data; // Alpha channel bitmap
+    int signature_len;
+    
+    ConnectedUser() : socket_fd(-1), signature_data(nullptr), signature_len(0) {
+        memset(username, 0, sizeof(username));
+    }
+    
+    ~ConnectedUser() {
+        if (signature_data) delete[] signature_data;
+    }
+};
+
 struct CanvasRoom {
     int id;
     vector<Layer*> layers;
@@ -123,6 +155,7 @@ struct CanvasRoom {
     
     vector<struct sockaddr_in> udp_clients;
     vector<int> tcp_clients;
+    map<int, ConnectedUser*> users; // Map socket_fd -> User info
     pthread_mutex_t mutex;
     
     void init(int canvas_id) {
@@ -141,6 +174,26 @@ struct CanvasRoom {
         layers.push_back(layer1);
         
         printf("[Server][Canvas %d] Initialized with %zu layers (paper + 1 drawable)\n", id, layers.size());
+    }
+    
+    void add_user(int fd, const char* name, const uint8_t* sig_data, int sig_len) {
+        ConnectedUser* u = new ConnectedUser();
+        u->socket_fd = fd;
+        strncpy(u->username, name, 31);
+        if (sig_data && sig_len > 0) {
+            u->signature_len = sig_len;
+            u->signature_data = new uint8_t[sig_len];
+            memcpy(u->signature_data, sig_data, sig_len);
+        }
+        users[fd] = u;
+        printf("[Server][Canvas %d] User %s added with signature (%d bytes)\n", id, name, sig_len);
+    }
+    
+    void remove_user(int fd) {
+        if (users.count(fd)) {
+            delete users[fd];
+            users.erase(fd);
+        }
     }
     
     void add_layer() {
@@ -182,6 +235,16 @@ struct CanvasRoom {
         delete layers[layer_idx];
         layers.erase(layers.begin() + layer_idx);
         printf("[Server][Canvas %d] Deleted layer #%d (remaining: %zu)\n", id, layer_idx, layers.size());
+    }
+
+    void reorder_layer(int old_idx, int new_idx) {
+        if (old_idx <= 0 || old_idx >= (int)layers.size() || new_idx <= 0 || new_idx >= (int)layers.size()) return;
+        if (old_idx == new_idx) return;
+        
+        Layer* l = layers[old_idx];
+        layers.erase(layers.begin() + old_idx);
+        layers.insert(layers.begin() + new_idx, l);
+        printf("[Server][Canvas %d] Moved layer %d to %d\n", id, old_idx, new_idx);
     }
     
     void flatten_to_buffer(Pixel* buffer) {
@@ -301,7 +364,7 @@ void handle_draw(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& sen
         }
     };
     if (msg.brush_id < (int)availableBrushes.size()) {
-        availableBrushes[msg.brush_id]->paint(msg.x, msg.y, col, msg.size, setPixel);
+        availableBrushes[msg.brush_id]->paint(msg.x, msg.y, col, msg.size, msg.pressure, setPixel);
     }
     broadcast_udp(room, msg, sender_addr);
     pthread_mutex_unlock(&room->mutex);
@@ -346,7 +409,7 @@ void handle_line(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& sen
 
     while (true) {
         if (msg.brush_id < (int)availableBrushes.size()) {
-            availableBrushes[msg.brush_id]->paint(x0, y0, col, msg.size, setPixel);
+            availableBrushes[msg.brush_id]->paint(x0, y0, col, msg.size, msg.pressure, setPixel);
         }
         if (x0 == x1 && y0 == y1) break;
         e2 = 2 * err;
@@ -492,6 +555,90 @@ bool start_canvas_thread(int canvas_id) {
 
 static const string b64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+// PackBits Compression (RLE variant)
+// Header N:
+// [0, 127]   -> (N+1) literal bytes follow
+// [-127, -1] -> Repeat next byte (1-N) times (2 to 128 times)
+// -128       -> No-op
+vector<uint8_t> packbits_compress(const uint8_t* data, size_t len) {
+    vector<uint8_t> out;
+    size_t i = 0;
+    while (i < len) {
+        // Look for run
+        size_t run_start = i;
+        while (i + 1 < len && data[i] == data[i+1] && (i - run_start) < 127) {
+            i++;
+        }
+        
+        if (i > run_start) {
+            // We have a run of (i - run_start + 1) bytes
+            // Length is at least 2
+            int count = (i - run_start + 1);
+            out.push_back((uint8_t)(257 - count)); // -count + 1 + 256 = 257 - count
+            out.push_back(data[run_start]);
+            i++;
+        } else {
+            // Look for literal run
+            size_t lit_start = i;
+            while (i + 1 < len && (data[i] != data[i+1] || (i + 2 < len && data[i+1] != data[i+2])) && (i - lit_start) < 127) {
+                i++;
+            }
+            // If we stopped because of a run, don't include the first byte of the run in the literal
+            if (i + 1 < len && data[i] == data[i+1]) {
+                // i is currently pointing to the first byte of the run
+                // but the loop condition incremented it.
+                // Actually, let's simplify.
+            }
+            
+            // Re-do literal logic simpler:
+            // Find length of literal run
+            // A literal run ends when we see 3 identical bytes (worth compressing) or hit 128 length
+            size_t j = i;
+            while (j < len && (j - i) < 128) {
+                if (j + 2 < len && data[j] == data[j+1] && data[j] == data[j+2]) {
+                    break; // Found a run of 3, stop literal here
+                }
+                j++;
+            }
+            
+            int count = (j - i);
+            out.push_back((uint8_t)(count - 1));
+            for (size_t k = 0; k < (size_t)count; k++) {
+                out.push_back(data[i + k]);
+            }
+            i = j;
+        }
+    }
+    return out;
+}
+
+vector<uint8_t> packbits_decompress(const vector<uint8_t>& in) {
+    vector<uint8_t> out;
+    size_t i = 0;
+    while (i < in.size()) {
+        int8_t n = (int8_t)in[i++];
+        if (n == -128) continue; // No-op
+        
+        if (n >= 0) {
+            // 0 to 127: Copy N+1 bytes
+            int count = n + 1;
+            for (int k = 0; k < count && i < in.size(); k++) {
+                out.push_back(in[i++]);
+            }
+        } else {
+            // -1 to -127: Repeat next byte (1-N) times
+            int count = 1 - n;
+            if (i < in.size()) {
+                uint8_t val = in[i++];
+                for (int k = 0; k < count; k++) {
+                    out.push_back(val);
+                }
+            }
+        }
+    }
+    return out;
+}
+
 bool is_base64(unsigned char c) {
     return (isalnum(c) || (c == '+') || (c == '/'));
 }
@@ -561,11 +708,18 @@ string encode_layer(Layer* layer) {
         }
     }
     
-    return base64_encode((const unsigned char*)buffer.data(), buffer.size() * sizeof(uint32_t));
+    // Compress using PackBits
+    vector<uint8_t> compressed = packbits_compress((const uint8_t*)buffer.data(), buffer.size() * sizeof(uint32_t));
+    
+    return base64_encode(compressed.data(), compressed.size());
 }
 
 void decode_layer(Layer* layer, const string& b64) {
-    vector<unsigned char> data = base64_decode(b64);
+    vector<unsigned char> compressed = base64_decode(b64);
+    
+    // Decompress using PackBits
+    vector<uint8_t> data = packbits_decompress(compressed);
+    
     uint32_t* pixels = (uint32_t*)data.data();
     int count = 0;
     int max_pixels = data.size() / sizeof(uint32_t);
@@ -714,7 +868,7 @@ void load_all_canvases() {
         }
         
         printf("[Server][Load] Canvas #%d: %d drawable layers loaded\n", canvas_id, layer_count);
-        pos++;
+        pos = layers_array_end;
     }
     
     printf("[Server][Load] ========== LOAD COMPLETE ==========\n\n");
@@ -802,9 +956,13 @@ void* tcp_client_session(void* arg) {
         switch (msg.type) {
             case MSG_LOGIN: {
                 int canvas_id = msg.canvas_id;
+                char username[32];
+                strncpy(username, msg.data, 31);
+                username[31] = '\0';
+                
                 if (canvas_id < 0) canvas_id = 0;
                 
-                printf("[Server][TCP] LOGIN: user='%s' canvas=%d\n", msg.data, canvas_id);
+                printf("[Server][TCP] LOGIN: user='%s' canvas=%d\n", username, canvas_id);
                 
                 if (!start_canvas_thread(canvas_id)) {
                     printf("[Server][TCP] ERROR: Failed to start canvas thread\n");
@@ -816,8 +974,10 @@ void* tcp_client_session(void* arg) {
                 CanvasRoom* room = get_or_create_canvas(canvas_id);
                 pthread_mutex_lock(&room->mutex);
                 room->tcp_clients.push_back(client_sock);
+                room->add_user(client_sock, username, nullptr, 0);
+                
                 printf("[Server][TCP] User '%s' registered to canvas #%d (clients: %zu)\n", 
-                       msg.data, canvas_id, room->tcp_clients.size());
+                       username, canvas_id, room->tcp_clients.size());
                 pthread_mutex_unlock(&room->mutex);
                 
                 TCPMessage response;
@@ -825,6 +985,7 @@ void* tcp_client_session(void* arg) {
                 response.type = MSG_WELCOME;
                 response.canvas_id = canvas_id;
                 response.layer_count = room->layers.size();
+                
                 write(client_sock, &response, sizeof(TCPMessage));
                 printf("[Server][TCP] Sent WELCOME (canvas=%d, layers=%d)\n", canvas_id, response.layer_count);
                 
@@ -832,7 +993,39 @@ void* tcp_client_session(void* arg) {
                 send_canvas_to_client(client_sock, canvas_id);
                 
                 printf("[Server][TCP] User '%s' logged into canvas #%d (UDP port %d)\n", 
-                       msg.data, canvas_id, room->udp_port);
+                       username, canvas_id, room->udp_port);
+                break;
+            }
+
+            case MSG_SIGNATURE: {
+                if (client_canvas_id < 0) break;
+                
+                printf("[Server][TCP] Received SIGNATURE (len=%d)\n", msg.data_len);
+                if (msg.data_len == 256) {
+                    CanvasRoom* room = get_or_create_canvas(client_canvas_id);
+                    pthread_mutex_lock(&room->mutex);
+                    
+                    // Find user
+                    if (room->users.count(client_sock)) {
+                        ConnectedUser* u = room->users[client_sock];
+                        if (u->signature_data) delete[] u->signature_data;
+                        u->signature_len = 256;
+                        u->signature_data = new uint8_t[256];
+                        memcpy(u->signature_data, msg.data, 256);
+                        printf("[Server][TCP] Stored signature for user '%s'\n", u->username);
+                        
+                        // Echo back to client immediately so they can see it
+                        TCPMessage echo;
+                        memset(&echo, 0, sizeof(echo));
+                        echo.type = MSG_SIGNATURE;
+                        echo.canvas_id = client_canvas_id;
+                        echo.data_len = 256;
+                        memcpy(echo.data, msg.data, 256);
+                        write(client_sock, &echo, sizeof(TCPMessage));
+                    }
+                    
+                    pthread_mutex_unlock(&room->mutex);
+                }
                 break;
             }
             
@@ -955,6 +1148,24 @@ void* tcp_client_session(void* arg) {
                     pthread_mutex_unlock(&room->mutex);
                 }
                 break;
+
+            case MSG_LAYER_REORDER:
+                // data[0] = old_idx, data[1] = new_idx
+                if (client_canvas_id >= 0) {
+                    int old_idx = (uint8_t)msg.data[0];
+                    int new_idx = (uint8_t)msg.data[1];
+                    
+                    CanvasRoom* room = get_or_create_canvas(client_canvas_id);
+                    pthread_mutex_lock(&room->mutex);
+                    room->reorder_layer(old_idx, new_idx);
+                    
+                    // Broadcast
+                    TCPMessage resp = msg; // Echo back
+                    broadcast_tcp(room, resp);
+                    
+                    pthread_mutex_unlock(&room->mutex);
+                }
+                break;
         }
     }
 
@@ -989,6 +1200,7 @@ int main() {
     availableBrushes.push_back(new RoundBrush());
     availableBrushes.push_back(new SquareBrush());
     availableBrushes.push_back(new HardEraserBrush());
+    availableBrushes.push_back(new PressureBrush());
     printf("[Server][Init] Loaded %zu brushes\n", availableBrushes.size());
 
     printf("[Server][Init] Setting up TCP on port %d...\n", PORT);

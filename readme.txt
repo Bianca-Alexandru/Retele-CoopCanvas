@@ -1,3 +1,6 @@
+* Precompiled versions of both server and client have been provided *
+* canvas.json will be created by the server if it doesn't exist but it is also provided as a clear example of how the data is kept *
+
 DEPENDENCIES
 ------------
 Client: Requires SDL2 library (sudo apt-get install libsdl2-dev)
@@ -28,6 +31,3 @@ USAGE
    ./client 10.100.0.30     //FII hosting
 
    //Port is hardcoded for ease of use
-
-
-
