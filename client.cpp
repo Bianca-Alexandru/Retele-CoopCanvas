@@ -126,12 +126,15 @@ int lastSigX = -1, lastSigY = -1;
 // Remote Clients (Signatures + Cursors)
 struct RemoteClient {
     int x, y;
+    uint8_t r, g, b; // <--- Add these
     SDL_Texture* sigTexture;
     bool hasSignature;
 };
 std::map<int, RemoteClient> remoteClients;
 pthread_mutex_t remoteClientsMutex = PTHREAD_MUTEX_INITIALIZER;
 int myUserId = 0; // Assigned by server via MSG_SIGNATURE broadcast or similar mechanism?
+int lastSentX = -1;
+int lastSentY = -1;
 // Actually, the server sends MSG_SIGNATURE with user_id.
 // If user_id matches ours, we ignore it (or store it but don't draw).
 // We need to know our own ID.
@@ -1020,6 +1023,12 @@ void* udp_receiver_thread(void* arg) {
                             pthread_mutex_lock(&remoteClientsMutex);
                             remoteClients[uid].x = pkt->x;
                             remoteClients[uid].y = pkt->y;
+                            
+                            // <--- Add these lines to update color
+                            remoteClients[uid].r = pkt->r;
+                            remoteClients[uid].g = pkt->g;
+                            remoteClients[uid].b = pkt->b;
+                            
                             // remoteClients[uid].hasSignature = (remoteClients[uid].sigTexture != nullptr); // REMOVED: Race condition
                             pthread_mutex_unlock(&remoteClientsMutex);
                         }
@@ -1570,6 +1579,22 @@ void handle_events() {
                     int mx = e.motion.x;
                     int my = e.motion.y;
                     
+                    // Cursor Visibility Logic
+                    bool overUI = false;
+                    // Check all active buttons (skip login buttons 0-2)
+                    for (size_t i = 3; i < buttons.size(); i++) {
+                        if (point_in_button(buttons[i], mx, my)) {
+                            overUI = true;
+                            break;
+                        }
+                    }
+                    
+                    if (overUI) {
+                        SDL_ShowCursor(SDL_ENABLE);
+                    } else {
+                        SDL_ShowCursor(SDL_DISABLE);
+                    }
+                    
                     if (dragLayerId != -1) {
                         dragCurrentY = my;
                     }
@@ -1586,7 +1611,11 @@ void handle_events() {
                     }
                     
                     if (loggedin && myUserId > 0) { // Only send if we know who we are
-                        send_udp_cursor(mx, my);
+                        if (mx != lastSentX || my != lastSentY) {
+                            send_udp_cursor(mx, my);
+                            lastSentX = mx;
+                            lastSentY = my;
+                        }
                     }
                     
                     if (mouseDown) {
@@ -1908,7 +1937,7 @@ int main(int argc, char* argv[]) {
                                 
                                 if (x < 39 && y < 13) {
                                     uint8_t alpha = val * 85;
-                                    Uint32 color = SDL_MapRGBA(surf->format, 0, 0, 0, alpha);
+                                    Uint32 color = SDL_MapRGBA(surf->format, 255, 255, 255, alpha);
                                     ((Uint32*)surf->pixels)[y * 39 + x] = color;
                                     setPixels++;
                                 }
@@ -1942,17 +1971,36 @@ int main(int argc, char* argv[]) {
             for (auto& [uid, client] : remoteClients) {
                 // if (client.hasSignature) printf("[Client][Render] UID=%d hasSig=%d tex=%p pos=(%d,%d)\n", uid, client.hasSignature, client.sigTexture, client.x, client.y);
                 if (client.hasSignature && client.sigTexture) {
-                    // Draw signature at bottom right of cursor
-                    // Requested size: 120x40
+                    // 1. Apply the user's color to the signature texture
+                    SDL_SetTextureColorMod(client.sigTexture, client.r, client.g, client.b);
+
+                    // 2. Smaller size (e.g., 80x26 instead of 120x40)
+                    // 3. Positioned to bottom-right (Offset x+15, y+15)
+                    //SIGNATURE POSITIONING
                     SDL_Rect sigRect = {
-                        client.x + 10, // Offset slightly to right
-                        client.y + 10, // Offset slightly down
-                        120, 40
+                        client.x, 
+                        client.y, 
+                        80, 26 
                     };
                     SDL_RenderCopy(r, client.sigTexture, NULL, &sigRect);
                 }
             }
             pthread_mutex_unlock(&remoteClientsMutex);
+
+            // Draw Eyedropper Crosshair
+            if (isEyedropping) {
+                int mx, my;
+                SDL_GetMouseState(&mx, &my);
+                
+                // Draw crosshair (Black outline, White inner)
+                SDL_SetRenderDrawColor(r, 0, 0, 0, 255);
+                SDL_RenderDrawLine(r, mx - 6, my, mx + 6, my);
+                SDL_RenderDrawLine(r, mx, my - 6, mx, my + 6);
+                
+                SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+                SDL_RenderDrawLine(r, mx - 3, my, mx + 3, my);
+                SDL_RenderDrawLine(r, mx, my - 3, mx, my + 3);
+            }
         });
         
         SDL_Delay(16); // ~60 FPS

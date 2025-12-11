@@ -26,8 +26,4 @@ USAGE
 2. Start one or more Clients:
    ./client [server_ip]
 
-   Examples:
-   ./client 127.0.0.1       //localhost
-   ./client 10.100.0.30     //FII hosting
-
    //Port is hardcoded for ease of use
