@@ -55,8 +55,8 @@ enum MsgType {
     MSG_SIGNATURE = 15     // New signature message
 };
 
-#define SIGNATURE_WIDTH 256
-#define SIGNATURE_HEIGHT 128
+#define SIGNATURE_WIDTH 390
+#define SIGNATURE_HEIGHT 130
 #define MAX_SIGNATURE_SIZE (SIGNATURE_WIDTH * SIGNATURE_HEIGHT) // 1 byte per pixel (alpha)
 
 struct TCPMessage {
@@ -65,6 +65,7 @@ struct TCPMessage {
     uint16_t data_len;
     uint8_t  layer_count;
     uint8_t  layer_id;
+    uint8_t  user_id; // Added for signature tracking
     char     data[256]; // Reverted payload size
 } __attribute__((packed));
 
@@ -117,10 +118,32 @@ bool isDrawingSignature = false;
 int lastSigX = -1, lastSigY = -1;
 
 // Remote Signature (Echoed back)
-SDL_Texture* remoteSignatureTexture = nullptr;
-SDL_Rect remoteSignatureRect = {0, 0, SIGNATURE_WIDTH, SIGNATURE_HEIGHT};
-uint8_t pendingSignatureData[256];
-volatile bool hasPendingSignature = false;
+// SDL_Texture* remoteSignatureTexture = nullptr; // Commented out as requested
+// SDL_Rect remoteSignatureRect = {0, 0, SIGNATURE_WIDTH, SIGNATURE_HEIGHT};
+// uint8_t pendingSignatureData[256];
+// volatile bool hasPendingSignature = false;
+
+// Remote Clients (Signatures + Cursors)
+struct RemoteClient {
+    int x, y;
+    SDL_Texture* sigTexture;
+    bool hasSignature;
+};
+std::map<int, RemoteClient> remoteClients;
+pthread_mutex_t remoteClientsMutex = PTHREAD_MUTEX_INITIALIZER;
+int myUserId = 0; // Assigned by server via MSG_SIGNATURE broadcast or similar mechanism?
+// Actually, the server sends MSG_SIGNATURE with user_id.
+// If user_id matches ours, we ignore it (or store it but don't draw).
+// We need to know our own ID.
+// The server sends us our own signature back as confirmation. We can use that to learn our ID.
+
+volatile bool pendingSigUpdate = false;
+struct PendingSig {
+    int user_id;
+    uint8_t data[128];
+};
+std::vector<PendingSig> pendingSignatures;
+pthread_mutex_t sigMutex = PTHREAD_MUTEX_INITIALIZER;
 
 
 // Layer system - each layer is CANVAS_WIDTH * CANVAS_HEIGHT * 4 bytes (RGBA)
@@ -289,47 +312,66 @@ int setup_udp(int canvas_id) {
     return 0;
 }
 
-// Helper to compress signature to 256 bytes (64x32 1-bit bitmap)
+// --- SIGNATURE IMPLEMENTATION START ---
+// Helper to compress signature to 128 bytes (39x13 2-bit grayscale)
 bool compress_signature(uint8_t* out_buffer) {
     if (!signatureTexture) return false;
     
+    // 1. Force the rendering to complete before reading
     SDL_SetRenderTarget(renderer, signatureTexture);
+    // (Optional: Draw a tiny invisible point to force context update)
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
+    SDL_RenderDrawPoint(renderer, 0, 0); 
+    
     uint8_t* raw_pixels = new uint8_t[SIGNATURE_WIDTH * SIGNATURE_HEIGHT * 4];
     
-    if (SDL_RenderReadPixels(renderer, NULL, SDL_PIXELFORMAT_RGBA8888, raw_pixels, SIGNATURE_WIDTH * 4) != 0) {
+    // Use ABGR8888 so that the memory layout is [R, G, B, A] on Little Endian
+    if (SDL_RenderReadPixels(renderer, NULL, SDL_PIXELFORMAT_ABGR8888, raw_pixels, SIGNATURE_WIDTH * 4) != 0) {
         printf("[Client][Signature] Failed to read pixels: %s\n", SDL_GetError());
         delete[] raw_pixels;
         SDL_SetRenderTarget(renderer, NULL);
         return false;
     }
     
-    memset(out_buffer, 0, 256);
+    memset(out_buffer, 0, 128);
     int setBits = 0;
     
-    for (int y = 0; y < 32; y++) {
-        for (int x = 0; x < 64; x++) {
-            // Average 4x4 block
+    // Grid: 39x13 = 507 pixels. Fits in 128 bytes (512 pixels capacity at 2bpp)
+    // Block size: 10x10
+    for (int y = 0; y < 13; y++) {
+        for (int x = 0; x < 39; x++) {
+            // Average 10x10 block
             int sumAlpha = 0;
-            for (int dy = 0; dy < 4; dy++) {
-                for (int dx = 0; dx < 4; dx++) {
-                    int sx = x * 4 + dx;
-                    int sy = y * 4 + dy;
+            for (int dy = 0; dy < 10; dy++) {
+                for (int dx = 0; dx < 10; dx++) {
+                    int sx = x * 10 + dx;
+                    int sy = y * 10 + dy;
                     int idx = (sy * SIGNATURE_WIDTH + sx) * 4;
                     sumAlpha += raw_pixels[idx + 3]; // Alpha
                 }
             }
-            // Threshold: if average alpha > 64 (25%), consider it marked
-            if (sumAlpha / 16 > 64) {
-                int bitIdx = y * 64 + x;
-                int byteIdx = bitIdx / 8;
-                int bitOffset = bitIdx % 8;
-                out_buffer[byteIdx] |= (1 << (7 - bitOffset)); // MSB first
-                setBits++;
-            }
+            
+            // Average alpha (0-255)
+            int avg = sumAlpha / 100;
+            
+            // Quantize to 2 bits (0, 1, 2, 3)
+            // 0-63 -> 0
+            // 64-127 -> 1
+            // 128-191 -> 2
+            // 192-255 -> 3
+            uint8_t val = avg / 64;
+            if (val > 0) setBits++;
+            
+            // Pack into buffer
+            int pixelIdx = y * 39 + x;
+            int byteIdx = pixelIdx / 4;
+            int shift = (3 - (pixelIdx % 4)) * 2; // MSB first
+            
+            out_buffer[byteIdx] |= (val << shift);
         }
     }
     
-    printf("[Client][Signature] Compressed signature: %d bits set out of 2048\n", setBits);
+    printf("[Client][Signature] Compressed signature: %d blocks active (2-bit grayscale)\n", setBits);
     
     delete[] raw_pixels;
     SDL_SetRenderTarget(renderer, NULL);
@@ -339,22 +381,23 @@ bool compress_signature(uint8_t* out_buffer) {
 void send_tcp_signature() {
     if (!signatureTexture) return;
     
-    uint8_t compressed[256];
+    uint8_t compressed[128];
     if (compress_signature(compressed)) {
         TCPMessage msg;
         memset(&msg, 0, sizeof(msg));
         msg.type = MSG_SIGNATURE;
         msg.canvas_id = currentCanvasId;
-        msg.data_len = 256;
-        memcpy(msg.data, compressed, 256);
+        msg.data_len = 128;
+        memcpy(msg.data, compressed, 128);
         
         if (send(tcpSock, &msg, sizeof(msg), 0) < 0) {
             perror("[Client][TCP] Signature send failed");
         } else {
-            printf("[Client][TCP] Sent signature (256 bytes)\n");
+            printf("[Client][TCP] Sent signature (128 bytes)\n");
         }
     }
 }
+// --- SIGNATURE IMPLEMENTATION END ---
 
 void send_tcp_login(const char* username) {
     if (tcpSock < 0) {
@@ -586,6 +629,7 @@ void send_udp_cursor(int x, int y) {
     pkt.type = MSG_CURSOR;
     pkt.x = x;
     pkt.y = y;
+    pkt.brush_id = myUserId; // Send our ID in the brush_id field
     pkt.r = userColor.r;
     pkt.g = userColor.g;
     pkt.b = userColor.b;
@@ -626,10 +670,11 @@ void* tcp_receiver_thread(void* arg) {
 
         switch (msg.type) {
             case MSG_WELCOME:
-                printf("[Client][TCP-Thread] WELCOME received! Canvas #%d, layers=%d\n", 
-                       msg.canvas_id, msg.layer_count);
+                printf("[Client][TCP-Thread] WELCOME received! Canvas #%d, layers=%d, UID=%d\n", 
+                       msg.canvas_id, msg.layer_count, msg.user_id);
                 
                 loggedin = 1;
+                myUserId = msg.user_id;
                 layerCount = msg.layer_count > 0 ? msg.layer_count : 2;
                 currentLayerId = 1;
                 
@@ -678,11 +723,57 @@ void* tcp_receiver_thread(void* arg) {
                 UpdateLayerButtons();
                 break;
 
+            // --- SIGNATURE IMPLEMENTATION START ---
             case MSG_SIGNATURE:
-                printf("[Client][TCP-Thread] Received echoed signature!\n");
-                memcpy(pendingSignatureData, msg.data, 256);
-                hasPendingSignature = true;
+                printf("[Client][TCP-Thread] Received signature for UID=%d\n", msg.user_id);
+                pthread_mutex_lock(&sigMutex);
+                {
+                    PendingSig ps;
+                    ps.user_id = msg.user_id;
+                    memcpy(ps.data, msg.data, 128);
+                    pendingSignatures.push_back(ps);
+                    pendingSigUpdate = true;
+                    
+                    // If this is the first time we see a signature and we don't have an ID yet,
+                    // and we just sent ours, maybe this is ours?
+                    // The server echoes our signature back.
+                    // We can assume the first one we get after login that matches our data is ours,
+                    // OR we just treat all of them as remote, and if we happen to draw our own, so be it.
+                    // But the requirement says "client cannot see their own signature".
+                    // We'll handle this in the main thread by checking if we are the sender.
+                    // Wait, we don't know if we are the sender unless we know our ID.
+                    // We'll assume the server sends us our ID in the MSG_SIGNATURE packet.
+                    // If we haven't set myUserId yet, and we just sent a signature, this might be it.
+                    // But simpler: The server sends existing clients first. Then ours.
+                    // Actually, we can just set myUserId when we receive the echo of our own signature.
+                    // But how do we know it's ours?
+                    // We'll assume the last one received after we send is ours? No.
+                    // We'll just render all other IDs. We need to know our ID.
+                    // Let's assume for now we render everyone else.
+                    // If we see a cursor moving that matches our mouse, that's us.
+                    // But we need to filter by ID.
+                    // Let's assume the server sends a special "You are ID X" packet or we infer it.
+                    // For now, we'll store all of them.
+                    if (myUserId == 0) {
+                         // Heuristic: If we just logged in, and we receive a signature that matches what we sent...
+                         // But we don't have what we sent easily accessible here.
+                         // Let's just store it.
+                         // Actually, we can use the fact that we don't receive cursor updates for ourselves via UDP usually?
+                         // No, UDP is broadcast to everyone usually.
+                         // If we receive a cursor update with ID X, and it matches our local mouse position exactly...
+                         // We'll handle ID assignment in main thread logic if possible.
+                         // For now, just store.
+                         if (myUserId == 0) myUserId = msg.user_id; // First one is us? No, existing users come first.
+                         // Actually, we can't easily know our ID without a dedicated packet.
+                         // But we can just render all signatures that have a corresponding cursor update.
+                         // We won't receive cursor updates for ourselves from the server if the server filters them?
+                         // Server code: "if (sock != client_sock)" for TCP, but for UDP "broadcast_udp" sends to all?
+                         // Let's check server broadcast_udp.
+                    }
+                }
+                pthread_mutex_unlock(&sigMutex);
                 break;
+            // --- SIGNATURE IMPLEMENTATION END ---
 
             case MSG_CANVAS_DATA:
                 printf("[Client][TCP-Thread] CANVAS_DATA received: %d bytes\n", msg.data_len);
@@ -847,6 +938,8 @@ void* udp_receiver_thread(void* arg) {
             UDPMessage* pkt = (UDPMessage*)buffer;
             
             switch (pkt->type) {
+
+
                 case MSG_DRAW:
                     {
                         int layer_idx = pkt->layer_id;
@@ -918,6 +1011,20 @@ void* udp_receiver_thread(void* arg) {
                 case MSG_CURSOR:
                     // Remote cursor
                     {
+                        // Update remote cursor position
+                        // Use brush_id as user_id
+                        int uid = pkt->brush_id;
+                        // printf("UDP Cursor Update: UID=%d  X=%d Y=%d\n", uid, pkt->x, pkt->y);
+                        if (uid != myUserId) { // Don't track ourselves
+                            // printf("[Client][UDP] Updating cursor for UID %d (My ID: %d)\n", uid, myUserId);
+                            pthread_mutex_lock(&remoteClientsMutex);
+                            remoteClients[uid].x = pkt->x;
+                            remoteClients[uid].y = pkt->y;
+                            // remoteClients[uid].hasSignature = (remoteClients[uid].sigTexture != nullptr); // REMOVED: Race condition
+                            pthread_mutex_unlock(&remoteClientsMutex);
+                        }
+                        
+                        // Also update legacy remote_cursors map for compatibility if needed
                         char key[32];
                         snprintf(key, sizeof(key), "%s:%d", 
                                  inet_ntoa(fromAddr.sin_addr), ntohs(fromAddr.sin_port));
@@ -1438,13 +1545,19 @@ void handle_events() {
                         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); // Black ink
                         
                         if (lastSigX >= 0 && lastSigY >= 0) {
-                            // Draw line
-                            SDL_RenderDrawLine(renderer, lastSigX, lastSigY, tx, ty);
-                            // Thicken it slightly
-                            SDL_RenderDrawLine(renderer, lastSigX+1, lastSigY, tx+1, ty);
-                            SDL_RenderDrawLine(renderer, lastSigX, lastSigY+1, tx, ty+1);
+                            // Draw thicker line (7x7 brush)
+                            for (int w = -3; w <= 3; w++) {
+                                for (int h = -3; h <= 3; h++) {
+                                    SDL_RenderDrawLine(renderer, lastSigX + w, lastSigY + h, tx + w, ty + h);
+                                }
+                            }
                         } else {
-                            SDL_RenderDrawPoint(renderer, tx, ty);
+                            // Draw point
+                            for (int w = -3; w <= 3; w++) {
+                                for (int h = -3; h <= 3; h++) {
+                                    SDL_RenderDrawPoint(renderer, tx + w, ty + h);
+                                }
+                            }
                         }
                         
                         SDL_SetRenderTarget(renderer, NULL);
@@ -1472,7 +1585,9 @@ void handle_events() {
                         }
                     }
                     
-                    send_udp_cursor(mx, my);
+                    if (loggedin && myUserId > 0) { // Only send if we know who we are
+                        send_udp_cursor(mx, my);
+                    }
                     
                     if (mouseDown) {
                         // Standard mouse drawing (no pressure)
@@ -1760,54 +1875,85 @@ int main(int argc, char* argv[]) {
             UpdateLayerButtons();
         }
 
-        // Check for pending signature
-        if (hasPendingSignature) {
-            hasPendingSignature = false;
-            printf("[Client][Main] Processing pending signature...\n");
-            SDL_Surface* surf = SDL_CreateRGBSurfaceWithFormat(0, 64, 32, 32, SDL_PIXELFORMAT_RGBA8888);
-            if (surf) {
-                SDL_LockSurface(surf);
-                // Clear to transparent
-                memset(surf->pixels, 0, 64 * 32 * 4);
-                
-                int setPixels = 0;
-                for (int i = 0; i < 256; i++) {
-                    uint8_t byte = pendingSignatureData[i];
-                    for (int bit = 0; bit < 8; bit++) {
-                        if ((byte >> (7 - bit)) & 1) {
-                            int pixelIdx = i * 8 + bit;
-                            int x = pixelIdx % 64;
-                            int y = pixelIdx / 64;
-                            if (x < 64 && y < 32) {
-                                Uint32 color = SDL_MapRGBA(surf->format, 0, 0, 0, 255);
-                                ((Uint32*)surf->pixels)[y * 64 + x] = color;
-                                setPixels++;
+        // --- SIGNATURE IMPLEMENTATION START ---
+        // Check for pending signatures
+        if (pendingSigUpdate) {
+            pthread_mutex_lock(&sigMutex);
+            std::vector<PendingSig> toProcess = pendingSignatures;
+            pendingSignatures.clear();
+            pendingSigUpdate = false;
+            pthread_mutex_unlock(&sigMutex);
+            
+            for (const auto& ps : toProcess) {
+                printf("[Client][Main] Processing pending signature for UID=%d...\n", ps.user_id);
+                // Reconstruct 39x13 surface
+                SDL_Surface* surf = SDL_CreateRGBSurfaceWithFormat(0, 39, 13, 32, SDL_PIXELFORMAT_RGBA8888);
+                if (surf) {
+                    SDL_LockSurface(surf);
+                    // Clear to transparent
+                    memset(surf->pixels, 0, 39 * 13 * 4);
+                    
+                    int setPixels = 0;
+                    for (int i = 0; i < 128; i++) {
+                        uint8_t byte = ps.data[i];
+                        // 4 pixels per byte (2 bits each)
+                        for (int p = 0; p < 4; p++) {
+                            int shift = (3 - p) * 2;
+                            uint8_t val = (byte >> shift) & 0x03;
+                            
+                            if (val > 0) {
+                                int pixelIdx = i * 4 + p;
+                                int x = pixelIdx % 39;
+                                int y = pixelIdx / 39;
+                                
+                                if (x < 39 && y < 13) {
+                                    uint8_t alpha = val * 85;
+                                    Uint32 color = SDL_MapRGBA(surf->format, 0, 0, 0, alpha);
+                                    ((Uint32*)surf->pixels)[y * 39 + x] = color;
+                                    setPixels++;
+                                }
                             }
                         }
                     }
+                    SDL_UnlockSurface(surf);
+                    
+                    // Store in remoteClients map
+                    pthread_mutex_lock(&remoteClientsMutex);
+                    if (remoteClients[ps.user_id].sigTexture) {
+                        SDL_DestroyTexture(remoteClients[ps.user_id].sigTexture);
+                    }
+                    remoteClients[ps.user_id].sigTexture = SDL_CreateTextureFromSurface(renderer, surf);
+                    SDL_SetTextureBlendMode(remoteClients[ps.user_id].sigTexture, SDL_BLENDMODE_BLEND);
+                    remoteClients[ps.user_id].hasSignature = true;
+                    pthread_mutex_unlock(&remoteClientsMutex);
+                    
+                    SDL_FreeSurface(surf);
+                    printf("[Client][Main] Stored signature for UID=%d\n", ps.user_id);
                 }
-                SDL_UnlockSurface(surf);
-                printf("[Client][Main] Reconstructed signature with %d pixels\n", setPixels);
-                
-                if (remoteSignatureTexture) SDL_DestroyTexture(remoteSignatureTexture);
-                remoteSignatureTexture = SDL_CreateTextureFromSurface(renderer, surf);
-                SDL_SetTextureBlendMode(remoteSignatureTexture, SDL_BLENDMODE_BLEND);
-                SDL_FreeSurface(surf);
-                
-                // Keep it small/native size or slightly scaled
-                remoteSignatureRect.w = 128; // 2x scale
-                remoteSignatureRect.h = 64;
-                remoteSignatureRect.x = (UI_WIDTH - remoteSignatureRect.w) / 2;
-                remoteSignatureRect.y = (UI_HEIGHT - remoteSignatureRect.h) / 2;
-                
-                printf("[Client][Main] Created remote signature texture (128x64)\n");
-            } else {
-                printf("[Client][Main] Failed to create surface for signature: %s\n", SDL_GetError());
             }
         }
+        // --- SIGNATURE IMPLEMENTATION END ---
 
         update_canvas_texture();
-        draw_ui(renderer);
+
+        draw_ui(renderer, [&](SDL_Renderer* r) {
+            // Render remote signatures attached to cursors
+            pthread_mutex_lock(&remoteClientsMutex);
+            for (auto& [uid, client] : remoteClients) {
+                // if (client.hasSignature) printf("[Client][Render] UID=%d hasSig=%d tex=%p pos=(%d,%d)\n", uid, client.hasSignature, client.sigTexture, client.x, client.y);
+                if (client.hasSignature && client.sigTexture) {
+                    // Draw signature at bottom right of cursor
+                    // Requested size: 120x40
+                    SDL_Rect sigRect = {
+                        client.x + 10, // Offset slightly to right
+                        client.y + 10, // Offset slightly down
+                        120, 40
+                    };
+                    SDL_RenderCopy(r, client.sigTexture, NULL, &sigRect);
+                }
+            }
+            pthread_mutex_unlock(&remoteClientsMutex);
+        });
         
         SDL_Delay(16); // ~60 FPS
     }

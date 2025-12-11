@@ -69,28 +69,49 @@ inline char* find_tablet_device() {
     return NULL;
 }
 
+#include <sys/poll.h>
+
+// ... (includes)
+
 // The thread loop
 inline void* input_thread_func(void* arg) {
     struct input_event ev;
+    struct pollfd pfd;
+    pfd.fd = device_fd;
+    pfd.events = POLLIN;
     
     printf("[RawInput] Thread started. Reading from fd %d...\n", device_fd);
 
     while (is_running) {
-        // Blocking read
-        ssize_t bytes = read(device_fd, &ev, sizeof(ev));
+        // Use poll with 100ms timeout to allow checking is_running
+        int ret = poll(&pfd, 1, 100);
         
-        if (bytes < (ssize_t)sizeof(ev)) {
-            if (bytes < 0 && errno != EINTR) {
-                perror("[RawInput] Read error");
-                break; // Exit on fatal error
-            }
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            perror("[RawInput] Poll error");
+            break;
+        }
+        
+        if (ret == 0) {
+            // Timeout, check is_running and loop again
             continue;
         }
+        
+        if (pfd.revents & POLLIN) {
+            ssize_t bytes = read(device_fd, &ev, sizeof(ev));
+            
+            if (bytes < (ssize_t)sizeof(ev)) {
+                if (bytes < 0 && errno != EINTR) {
+                    perror("[RawInput] Read error");
+                    break; // Exit on fatal error
+                }
+                continue;
+            }
 
-        if (ev.type == EV_ABS) {
-            if (ev.code == ABS_PRESSURE) {
-                current_pressure = ev.value;
-                // printf("[RawInput] Pressure Update: %d\n", ev.value); // Debug enabled
+            if (ev.type == EV_ABS) {
+                if (ev.code == ABS_PRESSURE) {
+                    current_pressure = ev.value;
+                }
             }
         }
     }
@@ -134,12 +155,13 @@ inline void RawInput_Stop(void) {
     if (!is_running) return;
 
     is_running = false;
-    // Cancel thread or wait for it? 
-    // Since read() is blocking, we might need to cancel or just close the fd to wake it up.
-    // Closing fd usually causes read to return error.
-    close(device_fd);
+    // Wait for thread to finish (it checks is_running every 100ms)
     pthread_join(input_thread, NULL);
-    device_fd = -1;
+    
+    if (device_fd >= 0) {
+        close(device_fd);
+        device_fd = -1;
+    }
     printf("[RawInput] Stopped.\n");
 }
 

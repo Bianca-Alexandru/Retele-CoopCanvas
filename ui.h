@@ -16,6 +16,7 @@
 #include <map>
 #include <string>
 #include <cmath>
+#include <functional>
 #include "brushes.h"
 
 using namespace std;
@@ -696,7 +697,7 @@ inline void UpdateLayerButtons() {
     }
 }
 
-inline void draw_ui(SDL_Renderer* renderer) {
+inline void draw_ui(SDL_Renderer* renderer, std::function<void(SDL_Renderer*)> postCanvasCallback = nullptr) {
     SDL_SetRenderDrawColor(renderer, 200, 200, 200, 255);
     SDL_RenderClear(renderer);
 
@@ -732,6 +733,10 @@ inline void draw_ui(SDL_Renderer* renderer) {
     }
 
     SDL_RenderCopy(renderer, canvasTexture, NULL, NULL);
+
+    if (postCanvasCallback) {
+        postCanvasCallback(renderer);
+    }
 
     // Draw all canvas UI buttons (tools, save, layer controls, undo/redo, layers)
     for (size_t i = 3; i < buttons.size(); i++) {
@@ -799,9 +804,9 @@ inline void draw_ui(SDL_Renderer* renderer) {
     }
 
     // Draw remote signature if available
-    if (remoteSignatureTexture) {
-        SDL_RenderCopy(renderer, remoteSignatureTexture, NULL, &remoteSignatureRect);
-    }
+    // if (remoteSignatureTexture) {
+    //     SDL_RenderCopy(renderer, remoteSignatureTexture, NULL, &remoteSignatureRect);
+    // }
 
     SDL_RenderPresent(renderer);
 }

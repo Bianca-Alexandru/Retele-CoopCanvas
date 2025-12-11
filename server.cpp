@@ -74,6 +74,7 @@ struct TCPMessage {
     uint16_t data_len;
     uint8_t  layer_count;
     uint8_t  layer_id;
+    uint8_t  user_id; // Added for signature tracking
     char     data[256]; // Reverted payload size
 } __attribute__((packed));
 
@@ -134,8 +135,9 @@ struct ConnectedUser {
     char username[32];
     uint8_t* signature_data; // Alpha channel bitmap
     int signature_len;
+    uint8_t room_uid; // Unique ID (1-255) within the room
     
-    ConnectedUser() : socket_fd(-1), signature_data(nullptr), signature_len(0) {
+    ConnectedUser() : socket_fd(-1), signature_data(nullptr), signature_len(0), room_uid(0) {
         memset(username, 0, sizeof(username));
     }
     
@@ -180,13 +182,27 @@ struct CanvasRoom {
         ConnectedUser* u = new ConnectedUser();
         u->socket_fd = fd;
         strncpy(u->username, name, 31);
+        
+        // Assign unique room_uid (1-255)
+        // Find first available ID
+        vector<bool> used_ids(256, false);
+        for (auto const& [key, val] : users) {
+            used_ids[val->room_uid] = true;
+        }
+        for (int i = 1; i < 256; i++) {
+            if (!used_ids[i]) {
+                u->room_uid = i;
+                break;
+            }
+        }
+        
         if (sig_data && sig_len > 0) {
             u->signature_len = sig_len;
             u->signature_data = new uint8_t[sig_len];
             memcpy(u->signature_data, sig_data, sig_len);
         }
         users[fd] = u;
-        printf("[Server][Canvas %d] User %s added with signature (%d bytes)\n", id, name, sig_len);
+        printf("[Server][Canvas %d] User %s added with signature (%d bytes), UID=%d\n", id, name, sig_len, u->room_uid);
     }
     
     void remove_user(int fd) {
@@ -377,8 +393,30 @@ void handle_cursor(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& s
         client_drawing[client_key] = false;
         printf("[Server][Canvas %d][UDP] DRAW END: client=%s\n", canvas_id, client_key.c_str());
     }
+    
+    // Inject room_uid into brush_id field for cursor tracking
+    UDPMessage fwd = msg;
+    // Find user by iterating (slow but works for small rooms)
+    // We need to match sender_addr to a ConnectedUser to get room_uid
+    // Since we don't have a direct map, we'll skip this for now and rely on client logic?
+    // No, the client needs the ID.
+    // Let's try to find the user.
+    // Note: This is O(N) where N is users in room. N is small.
+    // But we only have map<int, ConnectedUser*> users; (socket_fd -> User)
+    // We don't have UDP addr in ConnectedUser.
+    // We can't easily map it without changing the protocol or structure more.
+    // However, we can assume the client sends its ID if it knows it?
+    // Or we can just broadcast.
+    // Wait, if we can't map UDP->ID, we can't implement "signature follows cursor" for *specific* users.
+    // UNLESS we assume the client sends the ID in the packet.
+    // But the client doesn't know its ID initially.
+    // Let's assume the client sends 0 initially, and we can't track it.
+    // But once the client knows its ID (from MSG_SIGNATURE echo), it can send it.
+    // So we'll modify the client to send its ID in brush_id if it knows it.
+    // And the server just forwards it.
+    
     pthread_mutex_lock(&room->mutex);
-    broadcast_udp(room, msg, sender_addr);
+    broadcast_udp(room, fwd, sender_addr);
     pthread_mutex_unlock(&room->mutex);
 }
 
@@ -448,6 +486,39 @@ void* canvas_udp_thread(void* arg) {
                              (struct sockaddr*)&sender_addr, &len);
         
         if (bytes <= 0) continue;
+        
+        // Identify user by UDP address to attach room_uid
+        // Note: This requires mapping UDP address to ConnectedUser, which is tricky since ConnectedUser is TCP-based.
+        // However, we can try to match by IP if they are on the same machine, or we rely on the client sending the ID?
+        // The user said "connect the signature to the cursor in the data".
+        // Since we can't change UDPMessage structure, we must repurpose a field.
+        // We will use 'brush_id' in MSG_CURSOR to carry the room_uid.
+        
+        // Find the user ID associated with this sender
+        // For now, we'll just pass through what the client sends, but the client doesn't know its own ID yet?
+        // Actually, the server knows who sent it.
+        // We need to find the ConnectedUser that matches this UDP address.
+        // But ConnectedUser only has socket_fd (TCP).
+        // We'll assume for this project that we can just use the 'brush_id' field if the client sets it?
+        // No, the client doesn't know its ID. The server must set it.
+        
+        // Let's try to find the user by matching IP address from TCP sockets?
+        // This is unreliable behind NAT.
+        // Ideally, the client should send its ID.
+        // But the client doesn't know it until it receives the Welcome/Signature packet.
+        
+        // Hack: We will use the 'brush_id' field of MSG_CURSOR to store the room_uid.
+        // We need to find which ConnectedUser corresponds to this UDP packet.
+        // Since we don't have a direct map, we might have to skip this or rely on client sending it if they knew it.
+        // Wait, the user said "connect the signature to the cursor in the data".
+        // If I can't change UDPMessage, and I can't reliably map UDP->TCP user, 
+        // I will assume the client will send the ID in the 'brush_id' field once it knows it.
+        // But for the first packets it might not know.
+        
+        // BETTER APPROACH:
+        // When the client logs in (TCP), it gets its ID.
+        // The client then puts this ID into the 'brush_id' field of every MSG_CURSOR packet it sends.
+        // The server just broadcasts it.
         
         string client_key = addr_to_key(sender_addr);
         
@@ -578,22 +649,10 @@ vector<uint8_t> packbits_compress(const uint8_t* data, size_t len) {
             out.push_back(data[run_start]);
             i++;
         } else {
-            // Look for literal run
-            size_t lit_start = i;
-            while (i + 1 < len && (data[i] != data[i+1] || (i + 2 < len && data[i+1] != data[i+2])) && (i - lit_start) < 127) {
-                i++;
-            }
-            // If we stopped because of a run, don't include the first byte of the run in the literal
-            if (i + 1 < len && data[i] == data[i+1]) {
-                // i is currently pointing to the first byte of the run
-                // but the loop condition incremented it.
-                // Actually, let's simplify.
-            }
-            
-            // Re-do literal logic simpler:
-            // Find length of literal run
-            // A literal run ends when we see 3 identical bytes (worth compressing) or hit 128 length
+            // Literal Run (Non-repeating sequence)
             size_t j = i;
+            
+            // Advance j until we hit a run of 3 identical bytes OR max literal length (128)
             while (j < len && (j - i) < 128) {
                 if (j + 2 < len && data[j] == data[j+1] && data[j] == data[j+2]) {
                     break; // Found a run of 3, stop literal here
@@ -602,10 +661,12 @@ vector<uint8_t> packbits_compress(const uint8_t* data, size_t len) {
             }
             
             int count = (j - i);
-            out.push_back((uint8_t)(count - 1));
+            out.push_back((uint8_t)(count - 1)); // 0 means 1 literal byte
+            
             for (size_t k = 0; k < (size_t)count; k++) {
                 out.push_back(data[i + k]);
             }
+            
             i = j;
         }
     }
@@ -714,7 +775,7 @@ string encode_layer(Layer* layer) {
     return base64_encode(compressed.data(), compressed.size());
 }
 
-void decode_layer(Layer* layer, const string& b64) {
+void decode_layer(Layer* layer, const string& b64, int json_width, int json_height) {
     vector<unsigned char> compressed = base64_decode(b64);
     
     // Decompress using PackBits
@@ -724,14 +785,19 @@ void decode_layer(Layer* layer, const string& b64) {
     int count = 0;
     int max_pixels = data.size() / sizeof(uint32_t);
     
-    for (int y = 0; y < HEIGHT; y++) {
-        for (int x = 0; x < WIDTH; x++) {
+    // Iterate over the stored dimensions to consume the stream correctly
+    for (int y = 0; y < json_height; y++) {
+        for (int x = 0; x < json_width; x++) {
             if (count < max_pixels) {
                 uint32_t p = pixels[count++];
-                layer->pixels[x][y].r = (p >> 24) & 0xFF;
-                layer->pixels[x][y].g = (p >> 16) & 0xFF;
-                layer->pixels[x][y].b = (p >> 8) & 0xFF;
-                layer->pixels[x][y].a = p & 0xFF;
+                
+                // Only copy if within current bounds
+                if (x < WIDTH && y < HEIGHT) {
+                    layer->pixels[x][y].r = (p >> 24) & 0xFF;
+                    layer->pixels[x][y].g = (p >> 16) & 0xFF;
+                    layer->pixels[x][y].b = (p >> 8) & 0xFF;
+                    layer->pixels[x][y].a = p & 0xFF;
+                }
             }
         }
     }
@@ -819,6 +885,21 @@ void load_all_canvases() {
     string json = buffer;
     free(buffer);
     
+    int json_width = WIDTH;
+    int json_height = HEIGHT;
+    
+    size_t w_pos = json.find("\"width\":");
+    if (w_pos != string::npos) {
+        json_width = atoi(json.c_str() + w_pos + 8);
+    }
+    
+    size_t h_pos = json.find("\"height\":");
+    if (h_pos != string::npos) {
+        json_height = atoi(json.c_str() + h_pos + 9);
+    }
+    
+    printf("[Server][Load] JSON Dimensions: %dx%d (Current: %dx%d)\n", json_width, json_height, WIDTH, HEIGHT);
+    
     size_t pos = 0;
     while ((pos = json.find("\"id\":", pos)) != string::npos) {
         size_t id_start = pos + 5;
@@ -860,7 +941,7 @@ void load_all_canvases() {
                 room->layers.push_back(newLayer);
             }
             
-            decode_layer(room->layers[layer_count + 1], b64);
+            decode_layer(room->layers[layer_count + 1], b64, json_width, json_height);
             printf("[Server][Load] Canvas #%d Layer %d loaded\n", canvas_id, layer_count + 1);
             
             layer_count++;
@@ -975,6 +1056,7 @@ void* tcp_client_session(void* arg) {
                 pthread_mutex_lock(&room->mutex);
                 room->tcp_clients.push_back(client_sock);
                 room->add_user(client_sock, username, nullptr, 0);
+                int my_uid = room->users[client_sock]->room_uid;
                 
                 printf("[Server][TCP] User '%s' registered to canvas #%d (clients: %zu)\n", 
                        username, canvas_id, room->tcp_clients.size());
@@ -985,6 +1067,7 @@ void* tcp_client_session(void* arg) {
                 response.type = MSG_WELCOME;
                 response.canvas_id = canvas_id;
                 response.layer_count = room->layers.size();
+                response.user_id = my_uid;
                 
                 write(client_sock, &response, sizeof(TCPMessage));
                 printf("[Server][TCP] Sent WELCOME (canvas=%d, layers=%d)\n", canvas_id, response.layer_count);
@@ -992,16 +1075,34 @@ void* tcp_client_session(void* arg) {
                 // Send the actual canvas data to sync the new client
                 send_canvas_to_client(client_sock, canvas_id);
                 
+                // Send existing signatures to the new client
+                pthread_mutex_lock(&room->mutex);
+                for (auto const& [sock, user] : room->users) {
+                    if (sock != client_sock && user->signature_data) {
+                        TCPMessage sigMsg;
+                        memset(&sigMsg, 0, sizeof(sigMsg));
+                        sigMsg.type = MSG_SIGNATURE;
+                        sigMsg.canvas_id = canvas_id;
+                        sigMsg.data_len = 128;
+                        sigMsg.user_id = user->room_uid;
+                        memcpy(sigMsg.data, user->signature_data, 128);
+                        write(client_sock, &sigMsg, sizeof(TCPMessage));
+                        printf("[Server][TCP] Sent existing signature of UID=%d to new client\n", user->room_uid);
+                    }
+                }
+                pthread_mutex_unlock(&room->mutex);
+                
                 printf("[Server][TCP] User '%s' logged into canvas #%d (UDP port %d)\n", 
                        username, canvas_id, room->udp_port);
                 break;
             }
 
+            // --- SIGNATURE IMPLEMENTATION START ---
             case MSG_SIGNATURE: {
                 if (client_canvas_id < 0) break;
                 
                 printf("[Server][TCP] Received SIGNATURE (len=%d)\n", msg.data_len);
-                if (msg.data_len == 256) {
+                if (msg.data_len == 128) {
                     CanvasRoom* room = get_or_create_canvas(client_canvas_id);
                     pthread_mutex_lock(&room->mutex);
                     
@@ -1009,25 +1110,29 @@ void* tcp_client_session(void* arg) {
                     if (room->users.count(client_sock)) {
                         ConnectedUser* u = room->users[client_sock];
                         if (u->signature_data) delete[] u->signature_data;
-                        u->signature_len = 256;
-                        u->signature_data = new uint8_t[256];
-                        memcpy(u->signature_data, msg.data, 256);
-                        printf("[Server][TCP] Stored signature for user '%s'\n", u->username);
+                        u->signature_len = 128;
+                        u->signature_data = new uint8_t[128];
+                        memcpy(u->signature_data, msg.data, 128);
+                        printf("[Server][TCP] Stored signature for user '%s' (UID=%d)\n", u->username, u->room_uid);
                         
-                        // Echo back to client immediately so they can see it
-                        TCPMessage echo;
-                        memset(&echo, 0, sizeof(echo));
-                        echo.type = MSG_SIGNATURE;
-                        echo.canvas_id = client_canvas_id;
-                        echo.data_len = 256;
-                        memcpy(echo.data, msg.data, 256);
-                        write(client_sock, &echo, sizeof(TCPMessage));
+                        // Broadcast to ALL clients in the room (including sender, so they know their ID if needed, 
+                        // though client ignores own signature for display)
+                        TCPMessage broadcast;
+                        memset(&broadcast, 0, sizeof(broadcast));
+                        broadcast.type = MSG_SIGNATURE;
+                        broadcast.canvas_id = client_canvas_id;
+                        broadcast.data_len = 128;
+                        broadcast.user_id = u->room_uid; // Send the UID
+                        memcpy(broadcast.data, msg.data, 128);
+                        
+                        broadcast_tcp(room, broadcast);
                     }
                     
                     pthread_mutex_unlock(&room->mutex);
                 }
                 break;
             }
+            // --- SIGNATURE IMPLEMENTATION END ---
             
             case MSG_SAVE:
                 printf("[Server][TCP] SAVE request from socket %d\n", client_sock);
