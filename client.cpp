@@ -297,12 +297,14 @@ bool compress_signature(uint8_t* out_buffer) {
     uint8_t* raw_pixels = new uint8_t[SIGNATURE_WIDTH * SIGNATURE_HEIGHT * 4];
     
     if (SDL_RenderReadPixels(renderer, NULL, SDL_PIXELFORMAT_RGBA8888, raw_pixels, SIGNATURE_WIDTH * 4) != 0) {
+        printf("[Client][Signature] Failed to read pixels: %s\n", SDL_GetError());
         delete[] raw_pixels;
         SDL_SetRenderTarget(renderer, NULL);
         return false;
     }
     
     memset(out_buffer, 0, 256);
+    int setBits = 0;
     
     for (int y = 0; y < 32; y++) {
         for (int x = 0; x < 64; x++) {
@@ -322,9 +324,12 @@ bool compress_signature(uint8_t* out_buffer) {
                 int byteIdx = bitIdx / 8;
                 int bitOffset = bitIdx % 8;
                 out_buffer[byteIdx] |= (1 << (7 - bitOffset)); // MSB first
+                setBits++;
             }
         }
     }
+    
+    printf("[Client][Signature] Compressed signature: %d bits set out of 2048\n", setBits);
     
     delete[] raw_pixels;
     SDL_SetRenderTarget(renderer, NULL);
@@ -1477,7 +1482,7 @@ void handle_events() {
                             float p = RawInput_GetPressure();
                             if (p >= 0.0f) {
                                 pressure = (int)(p * 255);
-                                printf("[Client][Input] Raw Pressure: %.2f -> %d\n", p, pressure);
+                                // printf("[Client][Input] Raw Pressure: %.2f -> %d\n", p, pressure);
                             }
                         }
                         
@@ -1505,12 +1510,12 @@ void handle_events() {
 
             case SDL_CONTROLLERAXISMOTION:
                 // Debugging: Check if tablet pressure is being sent as a joystick axis
-                printf("[Client][Input] Axis Motion: Axis %d Value %d\n", e.caxis.axis, e.caxis.value);
+                // printf("[Client][Input] Axis Motion: Axis %d Value %d\n", e.caxis.axis, e.caxis.value);
                 break;
 
             case SDL_JOYAXISMOTION:
                 // Debugging: Check if tablet pressure is being sent as a joystick axis
-                printf("[Client][Input] Joystick Axis: Axis %d Value %d\n", e.jaxis.axis, e.jaxis.value);
+                // printf("[Client][Input] Joystick Axis: Axis %d Value %d\n", e.jaxis.axis, e.jaxis.value);
                 break;
 
             case SDL_KEYDOWN:
@@ -1758,12 +1763,14 @@ int main(int argc, char* argv[]) {
         // Check for pending signature
         if (hasPendingSignature) {
             hasPendingSignature = false;
+            printf("[Client][Main] Processing pending signature...\n");
             SDL_Surface* surf = SDL_CreateRGBSurfaceWithFormat(0, 64, 32, 32, SDL_PIXELFORMAT_RGBA8888);
             if (surf) {
                 SDL_LockSurface(surf);
                 // Clear to transparent
                 memset(surf->pixels, 0, 64 * 32 * 4);
                 
+                int setPixels = 0;
                 for (int i = 0; i < 256; i++) {
                     uint8_t byte = pendingSignatureData[i];
                     for (int bit = 0; bit < 8; bit++) {
@@ -1774,23 +1781,28 @@ int main(int argc, char* argv[]) {
                             if (x < 64 && y < 32) {
                                 Uint32 color = SDL_MapRGBA(surf->format, 0, 0, 0, 255);
                                 ((Uint32*)surf->pixels)[y * 64 + x] = color;
+                                setPixels++;
                             }
                         }
                     }
                 }
                 SDL_UnlockSurface(surf);
+                printf("[Client][Main] Reconstructed signature with %d pixels\n", setPixels);
                 
                 if (remoteSignatureTexture) SDL_DestroyTexture(remoteSignatureTexture);
                 remoteSignatureTexture = SDL_CreateTextureFromSurface(renderer, surf);
                 SDL_SetTextureBlendMode(remoteSignatureTexture, SDL_BLENDMODE_BLEND);
                 SDL_FreeSurface(surf);
                 
-                remoteSignatureRect.w = 256;
-                remoteSignatureRect.h = 128;
-                remoteSignatureRect.x = (UI_WIDTH - 256) / 2;
-                remoteSignatureRect.y = (UI_HEIGHT - 128) / 2;
+                // Keep it small/native size or slightly scaled
+                remoteSignatureRect.w = 128; // 2x scale
+                remoteSignatureRect.h = 64;
+                remoteSignatureRect.x = (UI_WIDTH - remoteSignatureRect.w) / 2;
+                remoteSignatureRect.y = (UI_HEIGHT - remoteSignatureRect.h) / 2;
                 
-                printf("[Client][Main] Created remote signature texture\n");
+                printf("[Client][Main] Created remote signature texture (128x64)\n");
+            } else {
+                printf("[Client][Main] Failed to create surface for signature: %s\n", SDL_GetError());
             }
         }
 
