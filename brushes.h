@@ -1,7 +1,7 @@
 #ifndef BRUSHES_H
 #define BRUSHES_H
 
-#ifdef SERVER_SIDE  //server used to use sdl2 too only for SDL_color but the uni server said no :C
+#ifdef SERVER_SIDE
     #include <cstdint>
     struct Pixel { uint8_t r, g, b, a; };
 #else
@@ -11,24 +11,20 @@
 
 #include <functional>
 #include <cmath>
+#include <cstdlib> 
 
-// Abstract base class for Brushes
-// Will add way more in the final version
 class Brush {
 public:
     int size = 5;
     int opacity = 255; // 0-255
     virtual ~Brush() = default;
-    
-    // Paint function: takes coordinates, color, size, pressure, and a callback to set a pixel
     virtual void paint(int x, int y, Pixel color, int size, int pressure, std::function<void(int, int, Pixel)> setPixel) = 0;
 };
 
-// Derived: Round Brush (Standard)
 class RoundBrush : public Brush {
 public:
     void paint(int x, int y, Pixel color, int size, int pressure, std::function<void(int, int, Pixel)> setPixel) override {
-        (void)pressure; // Unused for standard round brush
+        (void)pressure; 
         color.a = (uint8_t)((color.a * opacity) / 255);
         int r = size / 2;
         if (r < 1) {
@@ -45,7 +41,6 @@ public:
     }
 };
 
-// Derived: Square Brush
 class SquareBrush : public Brush {
 public:
     void paint(int x, int y, Pixel color, int size, int pressure, std::function<void(int, int, Pixel)> setPixel) override {
@@ -63,89 +58,99 @@ public:
 class HardEraserBrush : public Brush {
 public:
     void paint(int x, int y, Pixel color, int size, int pressure, std::function<void(int, int, Pixel)> setPixel) override {
-        (void)color; // unused
-        (void)pressure;
+        (void)color; (void)pressure;
         int r = size / 2;
         for (int i = -r; i <= r; i++) {
             for (int j = -r; j <= r; j++) {
-                // Set to white (paper color) for display, transparent for layer storage
-                Pixel erased = {255, 255, 255, 0};  // alpha=0 means erased on layer
+                Pixel erased = {255, 255, 255, 0}; 
                 setPixel(x + i, y + j, erased);
             }
         }
     }
 };
 
-// Derived: Pressure Brush
+// ================= MODIFIED BRUSHES START HERE =================
+
 class PressureBrush : public Brush {
 public:
-    void paint(int x, int y, Pixel color, int size, int pressure, std::function<void(int, int, Pixel)> setPixel) override {
-        // Calculate effective size based on pressure (0-255)
-        // Use float for smoother size calculation
+    void paint(int x, int y, Pixel color, int maxSize, int pressure, std::function<void(int, int, Pixel)> setPixel) override {
         float p = pressure / 255.0f;
-        float effectiveSizeFloat = size * sqrt(p);
-        int effectiveSize = (int)effectiveSizeFloat;
         
-        // Apply brush opacity
-        color.a = (uint8_t)((color.a * opacity) / 255);
+        // 1. Opacity Curve (Square Root)
+        // Ramps up fast: 10% pressure -> 45% opacity
+        float opacityCurve = 0.2f + 0.8f * sqrt(p);
+        if (opacityCurve > 1.0f) opacityCurve = 1.0f;
+        float baseAlpha = (color.a * opacity / 255.0f) * opacityCurve;
         
-        if (effectiveSize < 1) {
-            // If pressure is very low but non-zero, draw a single pixel with reduced alpha
-            if (pressure > 0) {
-                Pixel faint = color;
-                faint.a = (uint8_t)(color.a * p); 
-                setPixel(x, y, faint);
-            }
-            return;
-        }
-        
-        int r = effectiveSize / 2;
-        if (r < 1) {
-            setPixel(x, y, color);
-            return;
-        }
-        for (int i = -r; i <= r; i++) {
-            for (int j = -r; j <= r; j++) {
-                if (i*i + j*j <= r*r) {
-                    setPixel(x + i, y + j, color);
+        // 2. Size Influence (30% Minimum)
+        // 30% static base + 70% dynamic pressure
+        float effectiveDiameter = maxSize * (0.3f + 0.7f * p);
+        float radius = effectiveDiameter / 2.0f; 
+        if (radius < 0.5f) radius = 0.5f;
+
+        int range = (int)ceil(radius) + 1;
+
+        for (int i = -range; i <= range; i++) {
+            for (int j = -range; j <= range; j++) {
+                float dist = sqrt(i*i + j*j);
+                
+                // 3. Feathering / Soft Edge
+                // Instead of 1 pixel AA, we fade over the last 1.5 pixels.
+                // This hides the "stepping" artifact when size changes slightly.
+                float featherRange = 1.5f; 
+                float delta = (radius - dist + (featherRange / 2.0f)) / featherRange;
+                
+                // Clamp
+                if (delta < 0.0f) delta = 0.0f;
+                if (delta > 1.0f) delta = 1.0f;
+
+                if (delta > 0.0f) {
+                    Pixel px = color;
+                    // Apply feathering to alpha
+                    px.a = (uint8_t)(baseAlpha * delta);
+                    
+                    if (px.a > 0) {
+                        setPixel(x + i, y + j, px);
+                    }
                 }
             }
         }
     }
 };
 
-// Derived: Airbrush (Opacity/Density varies with pressure, Size varies slightly)
 class Airbrush : public Brush {
 public:
     void paint(int x, int y, Pixel color, int size, int pressure, std::function<void(int, int, Pixel)> setPixel) override {
-        // Size varies slightly: 80% base + 20% pressure
-        float pressureFactor = pressure / 255.0f;
-        int effectiveSize = (int)(size * (0.8f + 0.2f * pressureFactor));
+        float p = pressure / 255.0f;
+        
+        // 1. Size Influence
+        int effectiveSize = (int)(size * (0.7f + 0.3f * p));
         if (effectiveSize < 1) effectiveSize = 1;
         
-        // Apply brush opacity
-        color.a = (uint8_t)((color.a * opacity) / 255);
+        // 2. Pressure Opacity (More Transparent)
+        // Range reduced to 5% - 60% (was 10-100%) to allow building up layers
+        float pressureAlphaMod = 0.05f + 0.55f * p; 
         
-        int r = effectiveSize; // Use full size as radius for softer feel
+        int r = effectiveSize; 
         
         for (int i = -r; i <= r; i++) {
             for (int j = -r; j <= r; j++) {
-                float distSq = (float)(i*i + j*j);
-                float radiusSq = (float)(r*r);
+                float dist = sqrt(i*i + j*j);
                 
-                if (distSq <= radiusSq) {
-                    float dist = sqrt(distSq);
-                    // Falloff: 1.0 at center, 0.0 at edge
+                if (dist <= r) {
+                    // 3. Radial Falloff (Soft Center)
                     float falloff = 1.0f - (dist / r);
-                    if (falloff < 0) falloff = 0;
                     
-                    // Probability based on falloff and pressure
-                    // Higher pressure = denser dots
-                    float probability = falloff * pressureFactor;
+                    // Smooth the falloff (standard cubic ease-out) for softer look
+                    falloff = falloff * falloff; 
                     
-                    // Stochastic sampling (dithering)
-                    if ((rand() % 1000) / 1000.0f < probability) {
-                        setPixel(x + i, y + j, color);
+                    float finalAlphaFloat = (color.a * opacity / 255.0f) * pressureAlphaMod * falloff;
+                    
+                    Pixel px = color;
+                    px.a = (uint8_t)finalAlphaFloat;
+                    
+                    if (px.a > 0) {
+                        setPixel(x + i, y + j, px);
                     }
                 }
             }

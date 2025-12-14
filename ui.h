@@ -35,6 +35,8 @@ extern int loggedin;
 extern bool isEyedropping;
 extern vector<Brush*> availableBrushes;
 extern SDL_Texture* canvasTexture;
+extern SDL_Texture* layerTextures[];
+extern uint8_t layerOpacity[];
 
 struct RemoteCursor {
     int x, y;
@@ -140,7 +142,7 @@ public:
         userColor.g = (Uint8)(g_s * val);
         userColor.b = (Uint8)(b_s * val);
         userColor.a = 255;
-        printf("[Client][UI] Color changed to RGBA(%d,%d,%d,%d)\n", userColor.r, userColor.g, userColor.b, userColor.a);
+        ::printf("[Client][UI] Color changed to RGBA(%d,%d,%d,%d)\n", userColor.r, userColor.g, userColor.b, userColor.a);
     }
 };
 
@@ -184,7 +186,7 @@ public:
             linkedPicker->color = {(Uint8)r, (Uint8)g, (Uint8)b, 255};
             // Auto-update userColor to the pure hue when hue changes
             userColor = linkedPicker->color;
-            printf("[Client][UI] Hue changed, base color now RGB(%d,%d,%d)\n", r, g, b);
+            ::printf("[Client][UI] Hue changed, base color now RGB(%d,%d,%d)\n", r, g, b);
         }
     }
 };
@@ -242,7 +244,7 @@ public:
     
     virtual void Click() override {
         currentBrushId = brushId;
-        printf("[Client][UI] Brush switched to %d\n", brushId);
+        ::printf("[Client][UI] Brush switched to %d\n", brushId);
     }
 };
 
@@ -262,7 +264,7 @@ public:
     virtual void Click() override {
         if (currentBrushId >= 0 && currentBrushId < (int)availableBrushes.size()) {
             availableBrushes[currentBrushId]->size++;
-            printf("[Client][UI] Brush size increased to %d\n", availableBrushes[currentBrushId]->size);
+            ::printf("[Client][UI] Brush size increased to %d\n", availableBrushes[currentBrushId]->size);
         }
     }
 };
@@ -283,7 +285,7 @@ public:
         if (currentBrushId >= 0 && currentBrushId < (int)availableBrushes.size()) {
             if (availableBrushes[currentBrushId]->size > 1) {
                 availableBrushes[currentBrushId]->size--;
-                printf("[Client][UI] Brush size decreased to %d\n", availableBrushes[currentBrushId]->size);
+                ::printf("[Client][UI] Brush size decreased to %d\n", availableBrushes[currentBrushId]->size);
             }
         }
     }
@@ -316,7 +318,7 @@ public:
     }
     
     virtual void Click() override {
-        printf("[Client][UI] Login button clicked for canvas #%d\n", currentCanvasId);
+        ::printf("[Client][UI] Login button clicked for canvas #%d\n", currentCanvasId);
         send_tcp_login("username");  // Hardcoded username for now
     }
 };
@@ -337,7 +339,7 @@ public:
     virtual void Click() override {
         if (currentCanvasId > 0) {
             currentCanvasId--;
-            printf("[Client][UI] Lobby changed to canvas #%d\n", currentCanvasId);
+            ::printf("[Client][UI] Lobby changed to canvas #%d\n", currentCanvasId);
         }
     }
 };
@@ -358,7 +360,7 @@ public:
     virtual void Click() override {
         if (currentCanvasId < 9) {
             currentCanvasId++;
-            printf("[Client][UI] Lobby changed to canvas #%d\n", currentCanvasId);
+            ::printf("[Client][UI] Lobby changed to canvas #%d\n", currentCanvasId);
         }
     }
 };
@@ -381,7 +383,7 @@ public:
     }
     
     virtual void Click() override {
-        printf("[Client][UI] Save button clicked\n");
+        ::printf("[Client][UI] Save button clicked\n");
         send_tcp_save();
     }
 };
@@ -442,7 +444,7 @@ public:
     }
     
     virtual void Click() override {
-        printf("[Client][UI] Add layer button clicked\n");
+        ::printf("[Client][UI] Add layer button clicked\n");
         save_undo_state(); // Save state before adding
         send_tcp_add_layer();
         // layerCount will be updated when server broadcasts MSG_LAYER_ADD
@@ -462,12 +464,12 @@ public:
     
     virtual void Click() override {
         if (layerCount > 2 && currentLayerId > 0) {
-            printf("[Client][UI] Delete layer button clicked for layer %d\n", currentLayerId);
+            ::printf("[Client][UI] Delete layer button clicked for layer %d\n", currentLayerId);
             save_undo_state(); // Save state before deleting
             send_tcp_delete_layer(currentLayerId);
             // layerCount and currentLayerId will be updated when server broadcasts MSG_LAYER_DEL
         } else {
-            printf("[Client][UI] Cannot delete layer: must keep at least 1 drawable layer\n");
+            ::printf("[Client][UI] Cannot delete layer: must keep at least 1 drawable layer\n");
         }
     }
 };
@@ -544,7 +546,7 @@ public:
 
     virtual void Click() override {
         download_as_bmp();
-        printf("[Client][UI] Download button clicked\n");
+        ::printf("[Client][UI] Download button clicked\n");
     }
 };
 
@@ -575,7 +577,7 @@ public:
     
     virtual void Click() override {
         isEyedropping = !isEyedropping;
-        printf("[Client][UI] Eyedropper toggled: %s\n", isEyedropping ? "ON" : "OFF");
+        ::printf("[Client][UI] Eyedropper toggled: %s\n", isEyedropping ? "ON" : "OFF");
     }
 };
 
@@ -589,7 +591,7 @@ public:
 #define LAYER_BUTTONS_START 19
 
 inline void SetupUI() {
-    printf("[Client][UI] Setting up UI buttons...\n");
+    ::printf("[Client][UI] Setting up UI buttons...\n");
     
     // === LOGIN SCREEN BUTTONS (indices 0, 1, 2) ===
     LoginButton* loginBtn = new LoginButton();
@@ -673,7 +675,7 @@ inline void SetupUI() {
     // Initial layer buttons for layers 1-2
     UpdateLayerButtons();
 
-    printf("[Client][UI] UI setup complete: %zu buttons\n", buttons.size());
+    ::printf("[Client][UI] UI setup complete: %zu buttons\n", buttons.size());
 }
 
 inline void UpdateLayerButtons() {
@@ -732,7 +734,16 @@ inline void draw_ui(SDL_Renderer* renderer, std::function<void(SDL_Renderer*)> p
         return;
     }
 
-    SDL_RenderCopy(renderer, canvasTexture, NULL, NULL);
+    // Render all layers (GPU Compositing)
+    // Layer 0 is background (paper), drawn first.
+    for (int i = 0; i < layerCount; i++) {
+        if (layerTextures[i]) {
+            // Apply opacity
+            SDL_SetTextureAlphaMod(layerTextures[i], layerOpacity[i]);
+            SDL_RenderCopy(renderer, layerTextures[i], NULL, NULL);
+        }
+    }
+    // SDL_RenderCopy(renderer, canvasTexture, NULL, NULL); // Deprecated
 
     if (postCanvasCallback) {
         postCanvasCallback(renderer);
@@ -848,7 +859,7 @@ inline bool handle_canvas_ui_click(int x, int y) {
                 dragLayerId = lb->layerId;
                 dragStartY = y;
                 dragCurrentY = y;
-                printf("[Client][UI] Started dragging layer %d\n", dragLayerId);
+                ::printf("[Client][UI] Started dragging layer %d\n", dragLayerId);
             }
             
             btn->Click();
@@ -875,7 +886,7 @@ inline void handle_drag_end(int x, int y) {
         if (newIdx > numDrawableLayers) newIdx = numDrawableLayers;
         
         if (newIdx != dragLayerId) {
-            printf("[Client][UI] Dropped layer %d at index %d\n", dragLayerId, newIdx);
+            ::printf("[Client][UI] Dropped layer %d at index %d\n", dragLayerId, newIdx);
             send_tcp_reorder_layer(dragLayerId, newIdx);
         }
         

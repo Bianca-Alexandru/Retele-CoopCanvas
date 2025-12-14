@@ -158,15 +158,22 @@ int currentCanvasId = 0;
 int currentLayerId = 1;  // Start on layer 1 (not layer 0 which is paper)
 int layerCount = 2;      // Layer 0 (paper) + Layer 1 (drawable)
 int layerDisplayIds[MAX_LAYERS]; // Maps index -> original ID
-int layerOpacity[MAX_LAYERS]; // Opacity for each layer (0-255)
+uint8_t layerOpacity[MAX_LAYERS]; // Opacity for each layer (0-255)
 int loggedin = 0;
 volatile int running = 1;
 uint8_t* layers[MAX_LAYERS] = {nullptr};  // Layer 0 = paper (white), Layer 1+ = drawable
+// GPU mirrors of the layers
+SDL_Texture* layerTextures[MAX_LAYERS] = {nullptr};
+bool layerDirty[MAX_LAYERS] = {false}; // Track which layer needs updating
+
 uint8_t* compositeCanvas = nullptr;       // Final composited image for display
 pthread_mutex_t layerMutex = PTHREAD_MUTEX_INITIALIZER;  // Protects layers array and layerCount
 
 // Flag for pending UI updates (set by TCP thread, handled by main thread)
 volatile bool pendingLayerUpdate = false;
+
+// Flag to auto-select new layer if we requested it
+volatile bool pendingMyNewLayer = false;
 
 // Flags to prevent double-application of layer ops during Undo/Redo
 volatile int ignore_layer_add = 0;
@@ -477,6 +484,10 @@ void send_tcp_save() {
 
 void send_tcp_add_layer(int layer_id) {
     printf("[Client][TCP] Sending add layer request: layer=%d\n", layer_id);
+    
+    // FLAG: We asked for this, so we want to switch to it when it arrives
+    pendingMyNewLayer = true; 
+    
     if (send_tcp(MSG_LAYER_ADD, layer_id)) {
         printf("[Client][TCP] Add layer request sent\n");
     }
@@ -621,6 +632,7 @@ void send_udp_draw(int x, int y, int pressure) {
                     }
                 }
             });
+        layerDirty[layer_idx] = true;
     }
 }
 
@@ -711,6 +723,7 @@ void* tcp_receiver_thread(void* arg) {
                             }
                             
                             printf("[Client][TCP-Thread] Received layer %d: %zu bytes\n", l, received);
+                            layerDirty[l] = true; // Force GPU upload
                         }
                     }
                 }
@@ -797,6 +810,23 @@ void* tcp_receiver_thread(void* arg) {
                         init_layer(layerCount - 1, false);
                         printf("[Client][TCP-Thread] Created layer %d locally\n", layerCount - 1);
                     }
+                    
+                    // --- NEW LOGIC START ---
+                    if (pendingMyNewLayer) {
+                        // If I requested this, auto-select the new layer
+                        // usually the new layer is at the end (layerCount - 1) 
+                        // or at msg.layer_id if you support insertion
+                        
+                        // If msg.layer_id is reliable (index where it was added):
+                        currentLayerId = msg.layer_id; 
+                        
+                        // Or if you always append to top:
+                        // currentLayerId = layerCount - 1;
+
+                        printf("[Client][TCP-Thread] Auto-selecting my new layer: %d\n", currentLayerId);
+                        pendingMyNewLayer = false; // Reset flag
+                    }
+                    // --- NEW LOGIC END ---
                 }
                 pendingLayerUpdate = true;  // Main thread will call UpdateLayerButtons()
                 pthread_mutex_unlock(&layerMutex);
@@ -819,13 +849,19 @@ void* tcp_receiver_thread(void* arg) {
                             delete[] layers[msg.layer_id];
                             layers[msg.layer_id] = nullptr;
                         }
+                        // Texture destruction is handled in main thread via update_canvas_texture
+
                         // Shift all layers above down by one
                         for (int l = msg.layer_id; l < MAX_LAYERS - 1; l++) {
                             layers[l] = layers[l + 1];
                             layerOpacity[l] = layerOpacity[l + 1];
+                            layerTextures[l] = layerTextures[l + 1];
+                            layerDirty[l] = true; // Force re-upload to be safe
                         }
                         layers[MAX_LAYERS - 1] = nullptr;
                         layerOpacity[MAX_LAYERS - 1] = 255; // Reset opacity for new empty slot
+                        layerTextures[MAX_LAYERS - 1] = nullptr;
+                        layerDirty[MAX_LAYERS - 1] = false;
                         printf("[Client][TCP-Thread] Shifted layers down after deleting layer %d\n", msg.layer_id);
                     }
                     layerCount = msg.layer_count;
@@ -861,6 +897,7 @@ void* tcp_receiver_thread(void* arg) {
                         
                         if (received == layer_size) {
                             printf("[Client][TCP-Thread] Layer %d synced (%zu bytes)\n", layer_idx, received);
+                            layerDirty[layer_idx] = true;
                         } else {
                             printf("[Client][TCP-Thread] Layer sync incomplete: %zu/%zu bytes\n", received, layer_size);
                         }
@@ -882,23 +919,31 @@ void* tcp_receiver_thread(void* arg) {
                         uint8_t* movingLayer = layers[old_idx];
                         int movingId = layerDisplayIds[old_idx];
                         int movingOpacity = layerOpacity[old_idx];
+                        SDL_Texture* movingTexture = layerTextures[old_idx];
+                        bool movingDirty = layerDirty[old_idx];
                         
                         if (old_idx < new_idx) {
                             for (int i = old_idx; i < new_idx; i++) {
                                 layers[i] = layers[i+1];
                                 layerDisplayIds[i] = layerDisplayIds[i+1];
                                 layerOpacity[i] = layerOpacity[i+1];
+                                layerTextures[i] = layerTextures[i+1];
+                                layerDirty[i] = layerDirty[i+1];
                             }
                         } else {
                             for (int i = old_idx; i > new_idx; i--) {
                                 layers[i] = layers[i-1];
                                 layerDisplayIds[i] = layerDisplayIds[i-1];
                                 layerOpacity[i] = layerOpacity[i-1];
+                                layerTextures[i] = layerTextures[i-1];
+                                layerDirty[i] = layerDirty[i-1];
                             }
                         }
                         layers[new_idx] = movingLayer;
                         layerDisplayIds[new_idx] = movingId;
                         layerOpacity[new_idx] = movingOpacity;
+                        layerTextures[new_idx] = movingTexture;
+                        layerDirty[new_idx] = movingDirty;
                         
                         // Update current selection if needed
                         if (currentLayerId == old_idx) currentLayerId = new_idx;
@@ -1007,6 +1052,7 @@ void* udp_receiver_thread(void* arg) {
                                         }
                                     }
                                 });
+                            layerDirty[layer_idx] = true;
                         }
                     }
                     break;
@@ -1065,16 +1111,14 @@ void init_layer(int layer_idx, bool white) {
     
     if (white) {
         // White opaque (paper)
-        for (int i = 0; i < CANVAS_WIDTH * CANVAS_HEIGHT * 4; i += 4) {
-            layers[layer_idx][i]     = 255;
-            layers[layer_idx][i + 1] = 255;
-            layers[layer_idx][i + 2] = 255;
-            layers[layer_idx][i + 3] = 255;
-        }
+        memset(layers[layer_idx], 255, CANVAS_WIDTH * CANVAS_HEIGHT * 4);
     } else {
         // Fully transparent
         memset(layers[layer_idx], 0, CANVAS_WIDTH * CANVAS_HEIGHT * 4);
     }
+
+    // Mark for GPU Init (Do NOT call SDL here)
+    layerDirty[layer_idx] = true;
 }
 
 void save_undo_state() {
@@ -1112,6 +1156,9 @@ void perform_undo() {
     CanvasSnapshot* undoSnap = undoStack.back();
     undoStack.pop_back();
     undoSnap->restore();
+    
+    // Mark all layers as dirty after restore
+    for(int i=0; i<MAX_LAYERS; i++) layerDirty[i] = true;
     
     // Check for layer count mismatch (deleted or added layers)
     if (layerCount > oldLayerCount) {
@@ -1169,6 +1216,9 @@ void perform_redo() {
     CanvasSnapshot* redoSnap = redoStack.back();
     redoStack.pop_back();
     redoSnap->restore();
+    
+    // Mark all layers as dirty after restore
+    for(int i=0; i<MAX_LAYERS; i++) layerDirty[i] = true;
 
     // Check for layer count mismatch
     if (layerCount > oldLayerCount) {
@@ -1240,58 +1290,38 @@ void clear_signature(SDL_Renderer* renderer) {
 }
 
 void composite_layers() {
-    pthread_mutex_lock(&layerMutex);
-    
-    // Start with layer 0 (white paper)
-    memcpy(compositeCanvas, layers[0], CANVAS_WIDTH * CANVAS_HEIGHT * 4);
-    
-    // Composite each layer on top using alpha blending
-    for (int l = 1; l < layerCount && l < MAX_LAYERS; l++) {
-        if (!layers[l]) continue;
-        
-        for (int i = 0; i < CANVAS_WIDTH * CANVAS_HEIGHT * 4; i += 4) {
-            uint8_t srcR = layers[l][i];
-            uint8_t srcG = layers[l][i + 1];
-            uint8_t srcB = layers[l][i + 2];
-            uint8_t srcA = layers[l][i + 3];
-            
-            // Apply layer opacity
-            int layerOp = layerOpacity[l];
-            if (layerOp < 255) {
-                srcA = (uint8_t)((srcA * layerOp) / 255);
-            }
-            
-            if (srcA == 0) continue;  // Fully transparent, skip
-            
-            uint8_t dstR = compositeCanvas[i];
-            uint8_t dstG = compositeCanvas[i + 1];
-            uint8_t dstB = compositeCanvas[i + 2];
-            
-            if (srcA == 255) {
-                // Fully opaque, just copy
-                compositeCanvas[i]     = srcR;
-                compositeCanvas[i + 1] = srcG;
-                compositeCanvas[i + 2] = srcB;
-                compositeCanvas[i + 3] = 255;
-            } else {
-                // Alpha blend
-                float alpha = srcA / 255.0f;
-                compositeCanvas[i]     = (uint8_t)(srcR * alpha + dstR * (1 - alpha));
-                compositeCanvas[i + 1] = (uint8_t)(srcG * alpha + dstG * (1 - alpha));
-                compositeCanvas[i + 2] = (uint8_t)(srcB * alpha + dstB * (1 - alpha));
-                compositeCanvas[i + 3] = 255;
-            }
-        }
-    }
-    
-    pthread_mutex_unlock(&layerMutex);
+    // Deprecated: GPU compositing is now used.
+    // This function is kept empty to satisfy any legacy calls, 
+    // but the real work happens in the render loop.
 }
 
 void update_canvas_texture() {
-    if (!canvasTexture || !compositeCanvas) return;
-    
-    composite_layers();
-    SDL_UpdateTexture(canvasTexture, NULL, compositeCanvas, CANVAS_WIDTH * 4);
+    for (int i = 0; i < MAX_LAYERS; i++) {
+        // If we have data (layers[i]) but no texture, CREATE it now (Main Thread)
+        if (layers[i] && !layerTextures[i]) {
+            layerTextures[i] = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, 
+                                                 SDL_TEXTUREACCESS_STREAMING, 
+                                                 CANVAS_WIDTH, CANVAS_HEIGHT);
+            if (layerTextures[i]) {
+                SDL_SetTextureBlendMode(layerTextures[i], SDL_BLENDMODE_BLEND);
+                layerDirty[i] = true; // Force immediate upload
+                printf("[Client][Main] Created GPU Texture for Layer %d\n", i);
+            }
+        }
+        
+        // If we have NO data but HAVE a texture (Deleted layer), DESTROY it
+        if (!layers[i] && layerTextures[i]) {
+            SDL_DestroyTexture(layerTextures[i]);
+            layerTextures[i] = nullptr;
+            printf("[Client][Main] Destroyed GPU Texture for Layer %d\n", i);
+        }
+
+        // Upload data if dirty
+        if (layers[i] && layerTextures[i] && layerDirty[i]) {
+            SDL_UpdateTexture(layerTextures[i], NULL, layers[i], CANVAS_WIDTH * 4);
+            layerDirty[i] = false;
+        }
+    }
 }
 
 void download_as_bmp() {
@@ -1299,8 +1329,44 @@ void download_as_bmp() {
     printf("[Client][Download] Saving canvas as BMP...\n");
     
     if (!compositeCanvas) {
-        printf("[Client][Download] ERROR: No canvas data to save\n");
-        return;
+        // Allocate if missing
+        compositeCanvas = new uint8_t[CANVAS_WIDTH * CANVAS_HEIGHT * 4];
+    }
+    
+    // Perform CPU composition for saving
+    // 1. Clear to white (Layer 0)
+    for (int i = 0; i < CANVAS_WIDTH * CANVAS_HEIGHT * 4; i += 4) {
+        compositeCanvas[i]     = 255;
+        compositeCanvas[i + 1] = 255;
+        compositeCanvas[i + 2] = 255;
+        compositeCanvas[i + 3] = 255;
+    }
+    
+    // 2. Blend all other layers
+    for (int l = 1; l < layerCount; l++) {
+        if (layers[l]) {
+            for (int i = 0; i < CANVAS_WIDTH * CANVAS_HEIGHT * 4; i += 4) {
+                uint8_t srcA = layers[l][i + 3];
+                if (srcA == 0) continue;
+                
+                uint8_t srcR = layers[l][i];
+                uint8_t srcG = layers[l][i + 1];
+                uint8_t srcB = layers[l][i + 2];
+                
+                if (srcA == 255) {
+                    compositeCanvas[i]     = srcR;
+                    compositeCanvas[i + 1] = srcG;
+                    compositeCanvas[i + 2] = srcB;
+                    compositeCanvas[i + 3] = 255;
+                } else {
+                    // Simple alpha blend over opaque background
+                    float a = srcA / 255.0f;
+                    compositeCanvas[i]     = (uint8_t)(srcR * a + compositeCanvas[i] * (1.0f - a));
+                    compositeCanvas[i + 1] = (uint8_t)(srcG * a + compositeCanvas[i + 1] * (1.0f - a));
+                    compositeCanvas[i + 2] = (uint8_t)(srcB * a + compositeCanvas[i + 2] * (1.0f - a));
+                }
+            }
+        }
     }
     
     // Generate filename with timestamp
@@ -1355,6 +1421,41 @@ void init_brushes() {
     printf("[Client][Brushes] %zu brushes loaded\n", availableBrushes.size());
 }
 
+SDL_Color get_composite_pixel(int x, int y) {
+    SDL_Color c = {255, 255, 255, 255};
+    if (x < 0 || x >= CANVAS_WIDTH || y < 0 || y >= CANVAS_HEIGHT) return c;
+    
+    int idx = (y * CANVAS_WIDTH + x) * 4;
+    float r = 255.0f, g = 255.0f, b = 255.0f; // Start with white background
+    
+    // Iterate all layers (0 is paper, usually opaque white)
+    for (int i = 0; i < layerCount; i++) {
+        if (layers[i]) {
+            uint8_t srcR = layers[i][idx];
+            uint8_t srcG = layers[i][idx+1];
+            uint8_t srcB = layers[i][idx+2];
+            uint8_t srcA = layers[i][idx+3];
+            
+            if (srcA == 0) continue;
+            
+            if (srcA == 255) {
+                r = srcR; g = srcG; b = srcB;
+            } else {
+                float sa = srcA / 255.0f;
+                r = srcR * sa + r * (1.0f - sa);
+                g = srcG * sa + g * (1.0f - sa);
+                b = srcB * sa + b * (1.0f - sa);
+            }
+        }
+    }
+    
+    c.r = (uint8_t)r;
+    c.g = (uint8_t)g;
+    c.b = (uint8_t)b;
+    c.a = 255;
+    return c;
+}
+
 /*****************************************************************************
    SDL EVENT HANDLING
  *****************************************************************************/
@@ -1395,12 +1496,8 @@ void handle_events() {
                         if (!handle_canvas_ui_click(mx, my)) {
                             // If eyedropper is active, pick color
                             if (isEyedropping) {
-                                if (compositeCanvas && mx >= 0 && mx < CANVAS_WIDTH && my >= 0 && my < CANVAS_HEIGHT) {
-                                    int idx = (my * CANVAS_WIDTH + mx) * 4;
-                                    userColor.r = compositeCanvas[idx];
-                                    userColor.g = compositeCanvas[idx+1];
-                                    userColor.b = compositeCanvas[idx+2];
-                                    userColor.a = 255;
+                                if (mx >= 0 && mx < CANVAS_WIDTH && my >= 0 && my < CANVAS_HEIGHT) {
+                                    userColor = get_composite_pixel(mx, my);
                                     isEyedropping = false; // Turn off after picking
                                     printf("[Client][Tool] Picked color: %d,%d,%d\n", userColor.r, userColor.g, userColor.b);
                                 }
@@ -1432,12 +1529,8 @@ void handle_events() {
                         // Immediate pick on press
                         int mx = e.button.x;
                         int my = e.button.y;
-                        if (compositeCanvas && mx >= 0 && mx < CANVAS_WIDTH && my >= 0 && my < CANVAS_HEIGHT) {
-                            int idx = (my * CANVAS_WIDTH + mx) * 4;
-                            userColor.r = compositeCanvas[idx];
-                            userColor.g = compositeCanvas[idx+1];
-                            userColor.b = compositeCanvas[idx+2];
-                            userColor.a = 255;
+                        if (mx >= 0 && mx < CANVAS_WIDTH && my >= 0 && my < CANVAS_HEIGHT) {
+                            userColor = get_composite_pixel(mx, my);
                             printf("[Client][Tool] Right-click picked color: %d,%d,%d\n", userColor.r, userColor.g, userColor.b);
                         }
                     }
@@ -1601,12 +1694,8 @@ void handle_events() {
                     
                     // Continuous Eyedropper Update
                     if (isEyedropping) {
-                        if (compositeCanvas && mx >= 0 && mx < CANVAS_WIDTH && my >= 0 && my < CANVAS_HEIGHT) {
-                            int idx = (my * CANVAS_WIDTH + mx) * 4;
-                            userColor.r = compositeCanvas[idx];
-                            userColor.g = compositeCanvas[idx+1];
-                            userColor.b = compositeCanvas[idx+2];
-                            userColor.a = 255;
+                        if (mx >= 0 && mx < CANVAS_WIDTH && my >= 0 && my < CANVAS_HEIGHT) {
+                            userColor = get_composite_pixel(mx, my);
                         }
                     }
                     
@@ -1663,6 +1752,23 @@ void handle_events() {
                 break;
 
             case SDL_KEYDOWN:
+                if (loggedin) {
+                    if (e.key.keysym.sym == SDLK_q) {
+                        if (currentBrushId >= 0 && currentBrushId < (int)availableBrushes.size()) {
+                            if (availableBrushes[currentBrushId]->size > 1) {
+                                availableBrushes[currentBrushId]->size--;
+                                printf("[Client][UI] Brush size decreased to %d\n", availableBrushes[currentBrushId]->size);
+                            }
+                        }
+                    } else if (e.key.keysym.sym == SDLK_w) {
+                        if (currentBrushId >= 0 && currentBrushId < (int)availableBrushes.size()) {
+                            if (availableBrushes[currentBrushId]->size < 50) {
+                                availableBrushes[currentBrushId]->size++;
+                                printf("[Client][UI] Brush size increased to %d\n", availableBrushes[currentBrushId]->size);
+                            }
+                        }
+                    }
+                }
                 switch (e.key.keysym.sym) {
                     case SDLK_ESCAPE:
                         running = 0;
@@ -1969,6 +2075,7 @@ int main(int argc, char* argv[]) {
             // Render remote signatures attached to cursors
             pthread_mutex_lock(&remoteClientsMutex);
             for (auto& [uid, client] : remoteClients) {
+                if (uid == myUserId) continue; // Hide own signature
                 // if (client.hasSignature) printf("[Client][Render] UID=%d hasSig=%d tex=%p pos=(%d,%d)\n", uid, client.hasSignature, client.sigTexture, client.x, client.y);
                 if (client.hasSignature && client.sigTexture) {
                     // 1. Apply the user's color to the signature texture
@@ -2022,21 +2129,19 @@ int main(int argc, char* argv[]) {
     // Cleanup undo/redo stacks
     for (auto* snap : undoStack) delete snap;
     for (auto* snap : redoStack) delete snap;
-    undoStack.clear();
-    redoStack.clear();
     
-    // Cleanup layers
+    // Cleanup layer textures
     for (int i = 0; i < MAX_LAYERS; i++) {
+        if (layerTextures[i]) SDL_DestroyTexture(layerTextures[i]);
         if (layers[i]) delete[] layers[i];
     }
-    if (compositeCanvas) delete[] compositeCanvas;
-    
-    if (signatureTexture) SDL_DestroyTexture(signatureTexture);
-    SDL_DestroyTexture(canvasTexture);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
 
-    printf("[Client][Main] Goodbye!\n");
+    if (compositeCanvas) delete[] compositeCanvas;
+    if (canvasTexture) SDL_DestroyTexture(canvasTexture);
+    if (signatureTexture) SDL_DestroyTexture(signatureTexture);
+    if (renderer) SDL_DestroyRenderer(renderer);
+    if (window) SDL_DestroyWindow(window);
+
+    SDL_Quit();
     return 0;
 }
