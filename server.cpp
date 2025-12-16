@@ -37,7 +37,7 @@ using namespace std;
 #define PORT 6769
 #define WIDTH 640
 #define HEIGHT 480
-#define MAX_LAYERS 10
+#define MAX_LAYERS 15
 
 extern int errno;
 
@@ -60,11 +60,12 @@ enum MsgType {
     MSG_LAYER_SELECT = 12,
     MSG_LAYER_SYNC = 13,   // Full layer data sync (for undo/redo)
     MSG_LAYER_REORDER = 14, // Swap layers
-    MSG_SIGNATURE = 15      // New signature message
+    MSG_SIGNATURE = 15,      // New signature message
+    MSG_LAYER_MOVE = 17
 };
 
-#define SIGNATURE_WIDTH 256
-#define SIGNATURE_HEIGHT 128
+#define SIGNATURE_WIDTH 450
+#define SIGNATURE_HEIGHT 150
 #define MAX_SIGNATURE_SIZE (SIGNATURE_WIDTH * SIGNATURE_HEIGHT)
 
 // TCP Message (packed for network)
@@ -108,13 +109,18 @@ struct UDPMessage {
 
 struct Layer {
     Pixel pixels[WIDTH][HEIGHT];
-    
+    bool dirty;
+    string cached_b64;
+
+    Layer() : dirty(true) {}
+
     void init_transparent() {
         for (int x = 0; x < WIDTH; x++) {
             for (int y = 0; y < HEIGHT; y++) {
                 pixels[x][y] = {0, 0, 0, 0};
             }
         }
+        dirty = true;
     }
     
     void init_white() {
@@ -123,6 +129,7 @@ struct Layer {
                 pixels[x][y] = {255, 255, 255, 255};
             }
         }
+        dirty = true;
     }
 };
 
@@ -159,10 +166,12 @@ struct CanvasRoom {
     vector<int> tcp_clients;
     map<int, ConnectedUser*> users; // Map socket_fd -> User info
     pthread_mutex_t mutex;
+    bool dirty;
     
     void init(int canvas_id) {
         id = canvas_id;
         active = false;
+        dirty = true;
         udp_socket = -1;
         udp_port = PORT + 1 + canvas_id;
         pthread_mutex_init(&mutex, NULL);
@@ -374,13 +383,16 @@ void handle_draw(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& sen
     }
     
     pthread_mutex_lock(&room->mutex);
+    room->dirty = true;
     auto setPixel = [&](int px, int py, Pixel c) {
         if (px >= 0 && px < WIDTH && py >= 0 && py < HEIGHT) {
             room->layers[layer_idx]->pixels[px][py] = c;
+            room->layers[layer_idx]->dirty = true;
         }
     };
     if (msg.brush_id < (int)availableBrushes.size()) {
-        availableBrushes[msg.brush_id]->paint(msg.x, msg.y, col, msg.size, msg.pressure, setPixel);
+        int angle = msg.ex;
+        availableBrushes[msg.brush_id]->paint(msg.x, msg.y, col, msg.size, msg.pressure, angle, setPixel);
     }
     broadcast_udp(room, msg, sender_addr);
     pthread_mutex_unlock(&room->mutex);
@@ -396,25 +408,6 @@ void handle_cursor(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& s
     
     // Inject room_uid into brush_id field for cursor tracking
     UDPMessage fwd = msg;
-    // Find user by iterating (slow but works for small rooms)
-    // We need to match sender_addr to a ConnectedUser to get room_uid
-    // Since we don't have a direct map, we'll skip this for now and rely on client logic?
-    // No, the client needs the ID.
-    // Let's try to find the user.
-    // Note: This is O(N) where N is users in room. N is small.
-    // But we only have map<int, ConnectedUser*> users; (socket_fd -> User)
-    // We don't have UDP addr in ConnectedUser.
-    // We can't easily map it without changing the protocol or structure more.
-    // However, we can assume the client sends its ID if it knows it?
-    // Or we can just broadcast.
-    // Wait, if we can't map UDP->ID, we can't implement "signature follows cursor" for *specific* users.
-    // UNLESS we assume the client sends the ID in the packet.
-    // But the client doesn't know its ID initially.
-    // Let's assume the client sends 0 initially, and we can't track it.
-    // But once the client knows its ID (from MSG_SIGNATURE echo), it can send it.
-    // So we'll modify the client to send its ID in brush_id if it knows it.
-    // And the server just forwards it.
-    
     pthread_mutex_lock(&room->mutex);
     broadcast_udp(room, fwd, sender_addr);
     pthread_mutex_unlock(&room->mutex);
@@ -432,6 +425,7 @@ void handle_line(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& sen
            canvas_id, client_key.c_str(), msg.x, msg.y, msg.ex, msg.ey, layer_idx, msg.brush_id);
     
     pthread_mutex_lock(&room->mutex);
+    room->dirty = true;
     
     int x0 = msg.x, y0 = msg.y;
     int x1 = msg.ex, y1 = msg.ey;
@@ -439,15 +433,19 @@ void handle_line(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& sen
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy, e2;
     
+    // Calculate angle for the line
+    int angle = (int)(atan2(msg.ey - msg.y, msg.ex - msg.x) * 180.0 / M_PI);
+    
     auto setPixel = [&](int px, int py, Pixel c) {
         if (px >= 0 && px < WIDTH && py >= 0 && py < HEIGHT) {
             room->layers[layer_idx]->pixels[px][py] = c;
+            room->layers[layer_idx]->dirty = true;
         }
     };
 
     while (true) {
         if (msg.brush_id < (int)availableBrushes.size()) {
-            availableBrushes[msg.brush_id]->paint(x0, y0, col, msg.size, msg.pressure, setPixel);
+            availableBrushes[msg.brush_id]->paint(x0, y0, col, msg.size, msg.pressure, angle, setPixel);
         }
         if (x0 == x1 && y0 == y1) break;
         e2 = 2 * err;
@@ -487,38 +485,6 @@ void* canvas_udp_thread(void* arg) {
         
         if (bytes <= 0) continue;
         
-        // Identify user by UDP address to attach room_uid
-        // Note: This requires mapping UDP address to ConnectedUser, which is tricky since ConnectedUser is TCP-based.
-        // However, we can try to match by IP if they are on the same machine, or we rely on the client sending the ID?
-        // The user said "connect the signature to the cursor in the data".
-        // Since we can't change UDPMessage structure, we must repurpose a field.
-        // We will use 'brush_id' in MSG_CURSOR to carry the room_uid.
-        
-        // Find the user ID associated with this sender
-        // For now, we'll just pass through what the client sends, but the client doesn't know its own ID yet?
-        // Actually, the server knows who sent it.
-        // We need to find the ConnectedUser that matches this UDP address.
-        // But ConnectedUser only has socket_fd (TCP).
-        // We'll assume for this project that we can just use the 'brush_id' field if the client sets it?
-        // No, the client doesn't know its ID. The server must set it.
-        
-        // Let's try to find the user by matching IP address from TCP sockets?
-        // This is unreliable behind NAT.
-        // Ideally, the client should send its ID.
-        // But the client doesn't know it until it receives the Welcome/Signature packet.
-        
-        // Hack: We will use the 'brush_id' field of MSG_CURSOR to store the room_uid.
-        // We need to find which ConnectedUser corresponds to this UDP packet.
-        // Since we don't have a direct map, we might have to skip this or rely on client sending it if they knew it.
-        // Wait, the user said "connect the signature to the cursor in the data".
-        // If I can't change UDPMessage, and I can't reliably map UDP->TCP user, 
-        // I will assume the client will send the ID in the 'brush_id' field once it knows it.
-        // But for the first packets it might not know.
-        
-        // BETTER APPROACH:
-        // When the client logs in (TCP), it gets its ID.
-        // The client then puts this ID into the 'brush_id' field of every MSG_CURSOR packet it sends.
-        // The server just broadcasts it.
         
         string client_key = addr_to_key(sender_addr);
         
@@ -804,7 +770,17 @@ void decode_layer(Layer* layer, const string& b64, int json_width, int json_heig
 }
 
 void save_all_canvases() {
-    printf("\n[Server][Save] ========== SAVING TO canvas.json ==========\n");
+    // 1. Global Optimization: Check if ANYTHING is dirty
+    bool any_dirty = false;
+    for (auto& pair : canvases) {
+        if (pair.second->dirty) {
+            any_dirty = true;
+            break;
+        }
+    }
+    if (!any_dirty) return; // Silent return if nothing changed
+
+    printf("\n[Server][Save] ========== SAVING DIRTY CANVASES ==========\n");
     
     FILE* f = fopen("canvas.json", "w");
     if (!f) {
@@ -835,19 +811,31 @@ void save_all_canvases() {
         if (!first_canvas) fprintf(f, ",\n");
         first_canvas = false;
         
-        printf("[Server][Save] Canvas #%d: %zu layers\n", c, room->layers.size());
-        
         pthread_mutex_lock(&room->mutex);
+        
+        // Log only if this specific room changed
+        if (room->dirty) {
+            printf("[Server][Save] Saving Canvas #%d...\n", c);
+        }
         
         fprintf(f, "    {\n      \"id\": %d,\n      \"layer_count\": %zu,\n      \"layers\": [\n", c, room->layers.size() - 1);
         
         for (size_t l = 1; l < room->layers.size(); l++) {
-            string b64 = encode_layer(room->layers[l]);
-            printf("[Server][Save] Canvas #%d Layer %zu: %zu bytes encoded\n", c, l, b64.length());
-            fprintf(f, "        {\"index\": %zu, \"data\": \"%s\"}%s\n", l, b64.c_str(), (l < room->layers.size() - 1) ? "," : "");
+            Layer* layer = room->layers[l];
+            
+            // CACHING LOGIC
+            if (layer->dirty || layer->cached_b64.empty()) {
+                // Re-encode only if dirty
+                layer->cached_b64 = encode_layer(layer);
+                layer->dirty = false;
+            }
+            
+            fprintf(f, "        {\"index\": %zu, \"data\": \"%s\"}%s\n", l, layer->cached_b64.c_str(), (l < room->layers.size() - 1) ? "," : "");
         }
         
         fprintf(f, "      ]\n    }");
+        
+        room->dirty = false; // Reset room dirty flag
         pthread_mutex_unlock(&room->mutex);
         saved_count++;
     }
@@ -1016,6 +1004,40 @@ void send_canvas_to_client(int sock, int canvas_id) {
     printf("[Server][TCP] Sent canvas #%d complete\n", canvas_id);
 }
 
+void move_layer_buffer(Layer* layer, int dx, int dy) {
+    if (!layer) return;
+    if (dx == 0 && dy == 0) return;
+    layer->dirty = true;
+
+    // Use a temp buffer
+    Pixel** temp = new Pixel*[WIDTH];
+    for (int i = 0; i < WIDTH; i++) {
+        temp[i] = new Pixel[HEIGHT];
+        memset(temp[i], 0, HEIGHT * sizeof(Pixel)); // Clear to transparent
+    }
+
+    for (int x = 0; x < WIDTH; x++) {
+        for (int y = 0; y < HEIGHT; y++) {
+            // Calculate where this pixel comes FROM
+            int srcX = x - dx;
+            int srcY = y - dy;
+
+            if (srcX >= 0 && srcX < WIDTH && srcY >= 0 && srcY < HEIGHT) {
+                temp[x][y] = layer->pixels[srcX][srcY];
+            }
+        }
+    }
+
+    // Copy back and cleanup
+    for (int i = 0; i < WIDTH; i++) {
+        for (int j = 0; j < HEIGHT; j++) {
+            layer->pixels[i][j] = temp[i][j];
+        }
+        delete[] temp[i];
+    }
+    delete[] temp;
+}
+
 void* tcp_client_session(void* arg) {
     int client_sock = *((int*)arg);
     free(arg);
@@ -1148,6 +1170,7 @@ void* tcp_client_session(void* arg) {
                 if (client_canvas_id >= 0) {
                     CanvasRoom* room = get_or_create_canvas(client_canvas_id);
                     pthread_mutex_lock(&room->mutex);
+                    room->dirty = true;
                     
                     int added_at_index = -1;
                     // Check if it's an insertion or append
@@ -1180,6 +1203,7 @@ void* tcp_client_session(void* arg) {
                 if (client_canvas_id >= 0) {
                     CanvasRoom* room = get_or_create_canvas(client_canvas_id);
                     pthread_mutex_lock(&room->mutex);
+                    room->dirty = true;
                     room->delete_layer(msg.layer_id);
                     
                     // Prepare and broadcast response
@@ -1203,6 +1227,7 @@ void* tcp_client_session(void* arg) {
                 if (client_canvas_id >= 0) {
                     CanvasRoom* room = get_or_create_canvas(client_canvas_id);
                     pthread_mutex_lock(&room->mutex);
+                    room->dirty = true;
                     
                     int layer_idx = msg.layer_id;
                     if (layer_idx > 0 && layer_idx < (int)room->layers.size()) {
@@ -1219,6 +1244,7 @@ void* tcp_client_session(void* arg) {
                         if (received == layer_size) {
                             // Update server's layer
                             Layer* layer = room->layers[layer_idx];
+                            layer->dirty = true;
                             for (int x = 0; x < WIDTH; x++) {
                                 for (int y = 0; y < HEIGHT; y++) {
                                     int idx = (y * WIDTH + x) * 4;
@@ -1262,11 +1288,38 @@ void* tcp_client_session(void* arg) {
                     
                     CanvasRoom* room = get_or_create_canvas(client_canvas_id);
                     pthread_mutex_lock(&room->mutex);
+                    room->dirty = true;
                     room->reorder_layer(old_idx, new_idx);
                     
                     // Broadcast
                     TCPMessage resp = msg; // Echo back
                     broadcast_tcp(room, resp);
+                    
+                    pthread_mutex_unlock(&room->mutex);
+                }
+                break;
+
+            case MSG_LAYER_MOVE:
+                {
+                    if (client_canvas_id < 0) break;
+                    CanvasRoom* room = get_or_create_canvas(client_canvas_id);
+                    
+                    // Extract payload
+                    struct MoveData { int dx; int dy; } payload;
+                    memcpy(&payload, msg.data, sizeof(MoveData));
+                    
+                    printf("[Server][TCP] LAYER_MOVE: layer=%d dx=%d dy=%d\n", msg.layer_id, payload.dx, payload.dy);
+
+                    pthread_mutex_lock(&room->mutex);
+                    room->dirty = true;
+                    
+                    // 1. Apply to Server's Canvas
+                    if (msg.layer_id > 0 && msg.layer_id < (int)room->layers.size()) {
+                        move_layer_buffer(room->layers[msg.layer_id], payload.dx, payload.dy);
+                    }
+                    
+                    // 2. Broadcast to others
+                    broadcast_tcp(room, msg, client_sock); // Don't send back to sender (they already moved)
                     
                     pthread_mutex_unlock(&room->mutex);
                 }
@@ -1306,6 +1359,9 @@ int main() {
     availableBrushes.push_back(new SquareBrush());
     availableBrushes.push_back(new HardEraserBrush());
     availableBrushes.push_back(new PressureBrush());
+    availableBrushes.push_back(new Airbrush());
+    availableBrushes.push_back(new RealPaintBrush());
+    availableBrushes.push_back(new SoftEraserBrush());
     printf("[Server][Init] Loaded %zu brushes\n", availableBrushes.size());
 
     printf("[Server][Init] Setting up TCP on port %d...\n", PORT);
