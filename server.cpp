@@ -35,8 +35,8 @@
 using namespace std;
 
 #define PORT 6769
-#define WIDTH 640
-#define HEIGHT 480
+#define WIDTH 1280
+#define HEIGHT 720
 #define MAX_LAYERS 15
 
 extern int errno;
@@ -384,9 +384,23 @@ void handle_draw(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& sen
     
     pthread_mutex_lock(&room->mutex);
     room->dirty = true;
+    
+    bool isSoftEraser = (msg.brush_id == 3); // 3 is Soft Eraser
+
     auto setPixel = [&](int px, int py, Pixel c) {
         if (px >= 0 && px < WIDTH && py >= 0 && py < HEIGHT) {
-            room->layers[layer_idx]->pixels[px][py] = c;
+            if (isSoftEraser) {
+                // Soft Eraser Logic: Subtract Alpha
+                Pixel& current = room->layers[layer_idx]->pixels[px][py];
+                int currentAlpha = current.a;
+                int eraseStrength = c.a; // Brush passes strength in alpha
+                int newAlpha = currentAlpha - eraseStrength;
+                if (newAlpha < 0) newAlpha = 0;
+                current.a = (uint8_t)newAlpha;
+            } else {
+                // Normal Paint / Hard Eraser
+                room->layers[layer_idx]->pixels[px][py] = c;
+            }
             room->layers[layer_idx]->dirty = true;
         }
     };
@@ -436,9 +450,21 @@ void handle_line(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& sen
     // Calculate angle for the line
     int angle = (int)(atan2(msg.ey - msg.y, msg.ex - msg.x) * 180.0 / M_PI);
     
+    bool isSoftEraser = (msg.brush_id == 3); // 3 is Soft Eraser
+
     auto setPixel = [&](int px, int py, Pixel c) {
         if (px >= 0 && px < WIDTH && py >= 0 && py < HEIGHT) {
-            room->layers[layer_idx]->pixels[px][py] = c;
+            if (isSoftEraser) {
+                // Soft Eraser Logic: Subtract Alpha
+                Pixel& current = room->layers[layer_idx]->pixels[px][py];
+                int currentAlpha = current.a;
+                int eraseStrength = c.a; // Brush passes strength in alpha
+                int newAlpha = currentAlpha - eraseStrength;
+                if (newAlpha < 0) newAlpha = 0;
+                current.a = (uint8_t)newAlpha;
+            } else {
+                room->layers[layer_idx]->pixels[px][py] = c;
+            }
             room->layers[layer_idx]->dirty = true;
         }
     };
@@ -1105,9 +1131,9 @@ void* tcp_client_session(void* arg) {
                         memset(&sigMsg, 0, sizeof(sigMsg));
                         sigMsg.type = MSG_SIGNATURE;
                         sigMsg.canvas_id = canvas_id;
-                        sigMsg.data_len = 128;
+                        sigMsg.data_len = 256;
                         sigMsg.user_id = user->room_uid;
-                        memcpy(sigMsg.data, user->signature_data, 128);
+                        memcpy(sigMsg.data, user->signature_data, 256);
                         write(client_sock, &sigMsg, sizeof(TCPMessage));
                         printf("[Server][TCP] Sent existing signature of UID=%d to new client\n", user->room_uid);
                     }
@@ -1124,7 +1150,7 @@ void* tcp_client_session(void* arg) {
                 if (client_canvas_id < 0) break;
                 
                 printf("[Server][TCP] Received SIGNATURE (len=%d)\n", msg.data_len);
-                if (msg.data_len == 128) {
+                if (msg.data_len == 256) {
                     CanvasRoom* room = get_or_create_canvas(client_canvas_id);
                     pthread_mutex_lock(&room->mutex);
                     
@@ -1132,9 +1158,9 @@ void* tcp_client_session(void* arg) {
                     if (room->users.count(client_sock)) {
                         ConnectedUser* u = room->users[client_sock];
                         if (u->signature_data) delete[] u->signature_data;
-                        u->signature_len = 128;
-                        u->signature_data = new uint8_t[128];
-                        memcpy(u->signature_data, msg.data, 128);
+                        u->signature_len = 256;
+                        u->signature_data = new uint8_t[256];
+                        memcpy(u->signature_data, msg.data, 256);
                         printf("[Server][TCP] Stored signature for user '%s' (UID=%d)\n", u->username, u->room_uid);
                         
                         // Broadcast to ALL clients in the room (including sender, so they know their ID if needed, 
@@ -1143,9 +1169,9 @@ void* tcp_client_session(void* arg) {
                         memset(&broadcast, 0, sizeof(broadcast));
                         broadcast.type = MSG_SIGNATURE;
                         broadcast.canvas_id = client_canvas_id;
-                        broadcast.data_len = 128;
+                        broadcast.data_len = 256;
                         broadcast.user_id = u->room_uid; // Send the UID
-                        memcpy(broadcast.data, msg.data, 128);
+                        memcpy(broadcast.data, msg.data, 256);
                         
                         broadcast_tcp(room, broadcast);
                     }
@@ -1358,10 +1384,10 @@ int main() {
     availableBrushes.push_back(new RoundBrush());
     availableBrushes.push_back(new SquareBrush());
     availableBrushes.push_back(new HardEraserBrush());
+    availableBrushes.push_back(new SoftEraserBrush());
     availableBrushes.push_back(new PressureBrush());
     availableBrushes.push_back(new Airbrush());
-    availableBrushes.push_back(new RealPaintBrush());
-    availableBrushes.push_back(new SoftEraserBrush());
+    availableBrushes.push_back(new TexturedBrush());
     printf("[Server][Init] Loaded %zu brushes\n", availableBrushes.size());
 
     printf("[Server][Init] Setting up TCP on port %d...\n", PORT);

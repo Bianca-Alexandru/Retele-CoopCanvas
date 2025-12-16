@@ -29,23 +29,26 @@ using namespace std;
 
 #include "brushes.h"
 #include "RawInput.h"
+#include "undo.h"
 
 /*****************************************************************************
    CONSTANTS AND TYPES
    *****************************************************************************/
 
-#define CANVAS_WIDTH  640 //easy to change later
-#define CANVAS_HEIGHT 480
+#define MENU_WIDTH    640
+#define MENU_HEIGHT   480
+#define CANVAS_WIDTH  1280
+#define CANVAS_HEIGHT 720
 #define TCP_PORT      6769
 #define UDP_BASE_PORT 6770
 
 const int BRUSH_ROUND_ID = 0;
 const int BRUSH_SQUARE_ID = 1;
 const int BRUSH_ERASER_ID = 2;
-const int BRUSH_PRESSURE_ID = 3;
-const int BRUSH_AIRBRUSH_ID = 4;
-const int BRUSH_TEXTURE_ID = 5;
-const int BRUSH_SOFT_ERASER_ID = 6;
+const int BRUSH_SOFT_ERASER_ID = 3;
+const int BRUSH_PRESSURE_ID = 4;
+const int BRUSH_AIRBRUSH_ID = 5;
+const int BRUSH_TEXTURE_ID = 6;
 
 enum MsgType {
     MSG_LOGIN = 1,
@@ -115,6 +118,10 @@ char serverIp[64] = "127.0.0.1";
 bool use_raw_input = false;
 bool uiVisible = true; // Default to visible
 
+// Window Dimensions (Dynamic)
+int windowWidth = MENU_WIDTH;
+int windowHeight = MENU_HEIGHT;
+
 // Drawing
 SDL_Color userColor = {0, 0, 0, 255};
 int currentBrushId = 0;
@@ -123,6 +130,16 @@ int lastMouseX = -1, lastMouseY = -1;
 int lastStableAngle = 0; // Keeps track of the last valid drawing angle
 int lastSentPressure = -1; // Track last sent pressure to detect changes
 bool isEyedropping = false; // New state for eyedropper tool
+
+// Undo Timeout
+uint32_t lastActionTime = 0;
+const uint32_t UNDO_TIMEOUT_MS = 100000; // 100 seconds for now (was 15000)
+
+// Viewport / Panning
+int viewOffsetX = 0;
+int viewOffsetY = 0;
+bool isPanning = false;
+bool spacePressed = false;
 
 // Signature / Login
 SDL_Texture* signatureTexture = nullptr;
@@ -151,7 +168,7 @@ int lastSentY = -1;
 volatile bool pendingSigUpdate = false;
 struct PendingSig {
     int user_id;
-    uint8_t data[128];
+    uint8_t data[256];
 };
 std::vector<PendingSig> pendingSignatures;
 pthread_mutex_t sigMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -159,7 +176,7 @@ pthread_mutex_t sigMutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Layer system - each layer is CANVAS_WIDTH * CANVAS_HEIGHT * 4 bytes (RGBA)
 #define MAX_LAYERS 15
-#define MAX_UNDO_HISTORY 20
+#define MAX_UNDO_HISTORY 15
 
 // Canvas state
 int currentCanvasId = 0;
@@ -172,7 +189,42 @@ volatile int running = 1;
 uint8_t* layers[MAX_LAYERS] = {nullptr};  // Layer 0 = paper (white), Layer 1+ = drawable
 // GPU mirrors of the layers
 SDL_Texture* layerTextures[MAX_LAYERS] = {nullptr};
-bool layerDirty[MAX_LAYERS] = {false}; // Track which layer needs updating
+
+// --- DIRTY RECT TRACKING ---
+// Keeps track of the bounding box that needs updating for each layer
+SDL_Rect layerDirtyRects[MAX_LAYERS]; 
+bool layerIsDirty[MAX_LAYERS] = { false };
+
+// Helper to reset rects at startup
+void init_dirty_rects() {
+    for (int i=0; i<MAX_LAYERS; i++) {
+        layerDirtyRects[i] = {CANVAS_WIDTH, CANVAS_HEIGHT, 0, 0}; // Inverted init
+        layerIsDirty[i] = false;
+    }
+}
+
+// Helper to expand the dirty area
+void mark_layer_dirty(int layer_id, int x, int y, int brushSize) {
+    if (layer_id < 0 || layer_id >= MAX_LAYERS) return;
+    
+    // Add padding to ensure we catch anti-aliased edges
+    int padding = brushSize / 2 + 2; 
+    
+    int minX = max(0, x - padding);
+    int minY = max(0, y - padding);
+    int maxX = min(CANVAS_WIDTH, x + padding);
+    int maxY = min(CANVAS_HEIGHT, y + padding);
+
+    SDL_Rect* r = &layerDirtyRects[layer_id];
+    
+    // Expand the rect to include this new stroke
+    if (minX < r->x) r->x = minX;
+    if (minY < r->y) r->y = minY;
+    if (maxX > r->w) r->w = maxX; // Storing Max X in w temp
+    if (maxY > r->h) r->h = maxY; // Storing Max Y in h temp
+    
+    layerIsDirty[layer_id] = true;
+}
 
 uint8_t* compositeCanvas = nullptr;       // Final composited image for display
 pthread_mutex_t layerMutex = PTHREAD_MUTEX_INITIALIZER;  // Protects layers array and layerCount
@@ -187,63 +239,26 @@ volatile bool pendingMyNewLayer = false;
 volatile int ignore_layer_add = 0;
 volatile int ignore_layer_del = 0;
 
-// Undo/Redo system - stores snapshots of layers - will prob change later 
-// Undo/Redo + Layer system contributed 35% of wasted time and 60% of bugs </3 
-// Probably still has bugs leaving that for future me as a surprise :3
-struct CanvasSnapshot {
-    uint8_t* data[MAX_LAYERS];
-    int layerCount;
-    time_t timestamp;
-    
-    CanvasSnapshot() {
-        for (int i = 0; i < MAX_LAYERS; i++) data[i] = nullptr;
-        layerCount = 0;
-        timestamp = time(NULL);
-    }
-    
-    ~CanvasSnapshot() {
-        for (int i = 0; i < MAX_LAYERS; i++) {
-            if (data[i]) delete[] data[i];
-        }
-    }
-    
-    void capture() {
-        timestamp = time(NULL);
-        for (int i = 0; i < MAX_LAYERS; i++) {
-            if (data[i]) { delete[] data[i]; data[i] = nullptr; }
-            if (layers[i]) {
-                data[i] = new uint8_t[CANVAS_WIDTH * CANVAS_HEIGHT * 4];
-                memcpy(data[i], layers[i], CANVAS_WIDTH * CANVAS_HEIGHT * 4);
-            }
-        }
-        layerCount = ::layerCount;
-    }
-    
-    void restore() {
-        for (int i = 0; i < MAX_LAYERS; i++) {
-            if (data[i]) {
-                // Snapshot has data for this layer
-                if (!layers[i]) {
-                    // Allocate if missing
-                    layers[i] = new uint8_t[CANVAS_WIDTH * CANVAS_HEIGHT * 4];
-                }
-                // Copy data
-                memcpy(layers[i], data[i], CANVAS_WIDTH * CANVAS_HEIGHT * 4);
-            } else {
-                // Snapshot has no data for this layer
-                if (layers[i]) {
-                    // If we have a layer but snapshot doesn't, delete it
-                    delete[] layers[i];
-                    layers[i] = nullptr;
-                }
-            }
-        }
-        ::layerCount = layerCount;
-    }
-};
+// NEW UNDO SYSTEM
+std::vector<Command*> undoStack;
+std::vector<Command*> redoStack;
+PaintCommand* currentPaintCmd = nullptr;
 
-vector<CanvasSnapshot*> undoStack;
-vector<CanvasSnapshot*> redoStack;
+// Helper to clean up memory
+void clear_redo_stack() {
+    for (auto* cmd : redoStack) delete cmd;
+    redoStack.clear();
+}
+
+void push_undo_command(Command* cmd) {
+    undoStack.push_back(cmd);
+    if (undoStack.size() > MAX_UNDO_HISTORY) {
+        delete undoStack.front();
+        undoStack.erase(undoStack.begin());
+    }
+    lastActionTime = SDL_GetTicks(); // Update timestamp
+}
+
 bool strokeInProgress = false;
 
 // Brush system
@@ -276,10 +291,10 @@ void send_udp_draw(int x, int y, int pressure = 255, int angle = 0);
 void* tcp_receiver_thread(void* arg);
 void* udp_receiver_thread(void* arg);
 void init_layer(int layer_idx, bool white);
-void save_undo_state();
 void perform_undo();
 void perform_redo();
 void move_layer_local(int layer_id, int dx, int dy);
+void send_tcp_layer_move(int layer_id, int dx, int dy);
 
 // TCP thread handle
 pthread_t tcp_receiver_tid = 0;
@@ -352,45 +367,60 @@ bool compress_signature(uint8_t* out_buffer) {
         return false;
     }
     
-    memset(out_buffer, 0, 128);
+    memset(out_buffer, 0, 256);
     int setBits = 0;
     
-    // Grid: 45x15 = 675 pixels. Fits in 128 bytes (512 pixels capacity at 2bpp) ? NO!
-    // 45x15 = 675 blocks. 675 * 2 bits = 1350 bits = 169 bytes.
-    // We need to increase the buffer size or reduce resolution.
-    // Let's reduce resolution to fit in 128 bytes (1024 bits).
-    // 128 bytes = 1024 bits = 512 pixels (2bpp).
-    // Target: 450x150. 
-    // If we use 20x20 blocks: 22.5 x 7.5 -> 23x8 = 184 blocks. Fits easily.
-    // Let's use 15x15 blocks: 30 x 10 = 300 blocks. Fits easily.
+    // Grid: 45x15 = 675 blocks. 
+    // 675 * 2 bits = 1350 bits = 169 bytes.
+    // Fits in 256 bytes.
     
-    // Block size: 15x15
-    for (int y = 0; y < 10; y++) {
-        for (int x = 0; x < 30; x++) {
-            // Average 15x15 block
+    // Block size: 10x10
+    for (int y = 0; y < 15; y++) {
+        for (int x = 0; x < 45; x++) {
+            // Average 15x15 block -> CHANGED to 5x5 block for higher resolution
+            // 450 / 5 = 90 blocks wide
+            // 150 / 5 = 30 blocks high
+            // Total blocks = 2700
+            // 2700 * 2 bits = 5400 bits = 675 bytes.
+            // Wait, we only have 128 bytes in the payload?
+            // The struct TCPMessage has char data[256].
+            // We can use up to 256 bytes.
+            
+            // Let's try 10x10 blocks.
+            // 450 / 10 = 45 blocks wide
+            // 150 / 10 = 15 blocks high
+            // Total = 675 blocks.
+            // 675 * 2 bits = 1350 bits = 169 bytes. Fits in 256!
+            
+            // Previous was 15x15 blocks -> 30x10 grid = 300 blocks = 75 bytes.
+            
+            // NEW LOGIC: 10x10 blocks
             int sumAlpha = 0;
-            for (int dy = 0; dy < 15; dy++) {
-                for (int dx = 0; dx < 15; dx++) {
-                    int sx = x * 15 + dx;
-                    int sy = y * 15 + dy;
+            for (int dy = 0; dy < 10; dy++) {
+                for (int dx = 0; dx < 10; dx++) {
+                    int sx = x * 10 + dx;
+                    int sy = y * 10 + dy;
                     int idx = (sy * SIGNATURE_WIDTH + sx) * 4;
                     sumAlpha += raw_pixels[idx + 3]; // Alpha
                 }
             }
             
             // Average alpha (0-255)
-            int avg = sumAlpha / 225;
+            int avg = sumAlpha / 100;
             
             // Quantize to 2 bits (0, 1, 2, 3)
             uint8_t val = avg / 64;
             if (val > 0) setBits++;
             
             // Pack into buffer
-            int pixelIdx = y * 30 + x;
+            // Grid is 45 x 15
+            int pixelIdx = y * 45 + x;
             int byteIdx = pixelIdx / 4;
             int shift = (3 - (pixelIdx % 4)) * 2; // MSB first
             
-            out_buffer[byteIdx] |= (val << shift);
+            if (byteIdx < 256) {
+                out_buffer[byteIdx] |= (val << shift);
+            }
         }
     }
     
@@ -404,19 +434,20 @@ bool compress_signature(uint8_t* out_buffer) {
 void send_tcp_signature() {
     if (!signatureTexture) return;
     
-    uint8_t compressed[128];
+    // Increased buffer size to 256 to match TCPMessage data size
+    uint8_t compressed[256];
     if (compress_signature(compressed)) {
         TCPMessage msg;
         memset(&msg, 0, sizeof(msg));
         msg.type = MSG_SIGNATURE;
         msg.canvas_id = currentCanvasId;
-        msg.data_len = 128;
-        memcpy(msg.data, compressed, 128);
+        msg.data_len = 256; // Use full capacity
+        memcpy(msg.data, compressed, 256);
         
         if (send(tcpSock, &msg, sizeof(msg), 0) < 0) {
             perror("[Client][TCP] Signature send failed");
         } else {
-            printf("[Client][TCP] Sent signature (128 bytes)\n");
+            printf("[Client][TCP] Sent signature (256 bytes)\n");
         }
     }
 }
@@ -554,6 +585,23 @@ void send_tcp_reorder_layer(int old_idx, int new_idx) {
     }
 }
 
+void send_tcp_layer_move(int layer_id, int dx, int dy) {
+    if (tcpSock < 0) return;
+    TCPMessage msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_LAYER_MOVE;
+    msg.canvas_id = currentCanvasId;
+    msg.layer_id = layer_id;
+    
+    struct MoveData { int dx; int dy; } payload = { dx, dy };
+    memcpy(msg.data, &payload, sizeof(payload));
+    msg.data_len = sizeof(payload); 
+    
+    if (send(tcpSock, &msg, sizeof(msg), 0) < 0) {
+        perror("[Client] Failed to send Layer Move");
+    }
+}
+
 void send_udp_draw(int x, int y, int pressure, int angle) {
     if (udpSock < 0) return;
     if (x < 0 || x >= CANVAS_WIDTH || y < 0 || y >= CANVAS_HEIGHT) return;
@@ -589,12 +637,12 @@ void send_udp_draw(int x, int y, int pressure, int angle) {
     if (currentBrushId < (int)availableBrushes.size()) {
         SDL_Color col = userColor;
         int layer_idx = currentLayerId;
-        bool isEraser = (currentBrushId == 2);
-        bool isSoftEraser = (currentBrushId == 6);
+        bool isEraser = (currentBrushId == BRUSH_ERASER_ID);
+        bool isSoftEraser = (currentBrushId == BRUSH_SOFT_ERASER_ID);
         
-        // Apply pressure locally for prediction if it's the pressure brush (ID 3)
+        // Apply pressure locally for prediction if it's the pressure brush
         int effectiveSize = availableBrushes[currentBrushId]->size;
-        if (currentBrushId == 3) {
+        if (currentBrushId == BRUSH_PRESSURE_ID) {
             effectiveSize = (effectiveSize * pressure) / 255;
             if (effectiveSize < 1) effectiveSize = 1;
         }
@@ -668,7 +716,7 @@ void send_udp_draw(int x, int y, int pressure, int angle) {
                     }
                 }
             });
-        layerDirty[layer_idx] = true;
+        mark_layer_dirty(layer_idx, x, y, effectiveSize);
     }
 }
 
@@ -761,7 +809,8 @@ void* tcp_receiver_thread(void* arg) {
                             }
                             
                             printf("[Client][TCP-Thread] Received layer %d: %zu bytes\n", l, received);
-                            layerDirty[l] = true; // Force GPU upload
+                            layerIsDirty[l] = true; // Force GPU upload
+                            layerDirtyRects[l] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
                         }
                     }
                 }
@@ -774,6 +823,14 @@ void* tcp_receiver_thread(void* arg) {
                     pthread_create(&udp_tid, NULL, udp_receiver_thread, NULL);
                     pthread_detach(udp_tid);
                 }
+                
+                // --- RESIZE WINDOW TO CANVAS MODE ---
+                SDL_SetWindowSize(window, CANVAS_WIDTH, CANVAS_HEIGHT);
+                SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                windowWidth = CANVAS_WIDTH;
+                windowHeight = CANVAS_HEIGHT;
+                SetupUI();
+                
                 UpdateLayerButtons();
                 break;
 
@@ -784,7 +841,7 @@ void* tcp_receiver_thread(void* arg) {
                 {
                     PendingSig ps;
                     ps.user_id = msg.user_id;
-                    memcpy(ps.data, msg.data, 128);
+                    memcpy(ps.data, msg.data, 256); // Updated to 256 bytes
                     pendingSignatures.push_back(ps);
                     pendingSigUpdate = true;
                     
@@ -894,12 +951,13 @@ void* tcp_receiver_thread(void* arg) {
                             layers[l] = layers[l + 1];
                             layerOpacity[l] = layerOpacity[l + 1];
                             layerTextures[l] = layerTextures[l + 1];
-                            layerDirty[l] = true; // Force re-upload to be safe
+                            layerIsDirty[l] = true; // Force re-upload to be safe
+                            layerDirtyRects[l] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
                         }
                         layers[MAX_LAYERS - 1] = nullptr;
                         layerOpacity[MAX_LAYERS - 1] = 255; // Reset opacity for new empty slot
                         layerTextures[MAX_LAYERS - 1] = nullptr;
-                        layerDirty[MAX_LAYERS - 1] = false;
+                        layerIsDirty[MAX_LAYERS - 1] = false;
                         printf("[Client][TCP-Thread] Shifted layers down after deleting layer %d\n", msg.layer_id);
                     }
                     layerCount = msg.layer_count;
@@ -935,7 +993,8 @@ void* tcp_receiver_thread(void* arg) {
                         
                         if (received == layer_size) {
                             printf("[Client][TCP-Thread] Layer %d synced (%zu bytes)\n", layer_idx, received);
-                            layerDirty[layer_idx] = true;
+                            layerIsDirty[layer_idx] = true;
+                            layerDirtyRects[layer_idx] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
                         } else {
                             printf("[Client][TCP-Thread] Layer sync incomplete: %zu/%zu bytes\n", received, layer_size);
                         }
@@ -958,7 +1017,7 @@ void* tcp_receiver_thread(void* arg) {
                         int movingId = layerDisplayIds[old_idx];
                         int movingOpacity = layerOpacity[old_idx];
                         SDL_Texture* movingTexture = layerTextures[old_idx];
-                        bool movingDirty = layerDirty[old_idx];
+                        bool movingDirty = layerIsDirty[old_idx];
                         
                         if (old_idx < new_idx) {
                             for (int i = old_idx; i < new_idx; i++) {
@@ -966,7 +1025,7 @@ void* tcp_receiver_thread(void* arg) {
                                 layerDisplayIds[i] = layerDisplayIds[i+1];
                                 layerOpacity[i] = layerOpacity[i+1];
                                 layerTextures[i] = layerTextures[i+1];
-                                layerDirty[i] = layerDirty[i+1];
+                                layerIsDirty[i] = layerIsDirty[i+1];
                             }
                         } else {
                             for (int i = old_idx; i > new_idx; i--) {
@@ -974,14 +1033,14 @@ void* tcp_receiver_thread(void* arg) {
                                 layerDisplayIds[i] = layerDisplayIds[i-1];
                                 layerOpacity[i] = layerOpacity[i-1];
                                 layerTextures[i] = layerTextures[i-1];
-                                layerDirty[i] = layerDirty[i-1];
+                                layerIsDirty[i] = layerIsDirty[i-1];
                             }
                         }
                         layers[new_idx] = movingLayer;
                         layerDisplayIds[new_idx] = movingId;
                         layerOpacity[new_idx] = movingOpacity;
                         layerTextures[new_idx] = movingTexture;
-                        layerDirty[new_idx] = movingDirty;
+                        layerIsDirty[new_idx] = movingDirty;
                         
                         // Update current selection if needed
                         if (currentLayerId == old_idx) currentLayerId = new_idx;
@@ -1054,8 +1113,8 @@ void* udp_receiver_thread(void* arg) {
                         if (pkt->brush_id < (int)availableBrushes.size()) {
                             SDL_Color col = {pkt->r, pkt->g, pkt->b, pkt->a};
                             int brushSize = pkt->size > 0 ? pkt->size : 5;
-                            bool isEraser = (pkt->brush_id == 2);
-                            bool isSoftEraser = (pkt->brush_id == 6);
+                            bool isEraser = (pkt->brush_id == BRUSH_ERASER_ID);
+                            bool isSoftEraser = (pkt->brush_id == BRUSH_SOFT_ERASER_ID);
                             int angle = pkt->ex;
                             
                             availableBrushes[pkt->brush_id]->paint(pkt->x, pkt->y, col, brushSize, pkt->pressure, angle,
@@ -1117,7 +1176,10 @@ void* udp_receiver_thread(void* arg) {
                                         }
                                     }
                                 });
-                            layerDirty[layer_idx] = true;
+                            
+                            pthread_mutex_lock(&layerMutex);
+                            mark_layer_dirty(layer_idx, pkt->x, pkt->y, brushSize);
+                            pthread_mutex_unlock(&layerMutex);
                         }
                     }
                     break;
@@ -1183,143 +1245,82 @@ void init_layer(int layer_idx, bool white) {
     }
 
     // Mark for GPU Init (Do NOT call SDL here)
-    layerDirty[layer_idx] = true;
+    layerIsDirty[layer_idx] = true;
+    layerDirtyRects[layer_idx] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
 }
 
-void save_undo_state() {
-    // Clear redo stack when new action is performed
-    for (auto* snap : redoStack) delete snap;
-    redoStack.clear();
-    
-    // Save current state to undo stack
-    CanvasSnapshot* snapshot = new CanvasSnapshot();
-    snapshot->capture();
-    undoStack.push_back(snapshot);
-    
-    // Limit undo history size
-    while (undoStack.size() > MAX_UNDO_HISTORY) {
-        delete undoStack.front();
-        undoStack.erase(undoStack.begin());
-    }
+// Wrappers for UI buttons
+void record_add_layer_command() {
+    // Adding is tricky because we don't know the ID yet.
+    // For now, we'll just clear redo stack to avoid inconsistencies.
+    clear_redo_stack();
+}
+
+void record_delete_layer_command(int layer_id) {
+    clear_redo_stack();
+    DeleteLayerCommand* cmd = new DeleteLayerCommand(layer_id, CANVAS_WIDTH, CANVAS_HEIGHT);
+    push_undo_command(cmd);
 }
 
 void perform_undo() {
     if (undoStack.empty()) {
-        printf("[Client][Undo] Nothing to undo\n");
+        printf("[Client] Nothing to undo.\n");
         return;
     }
-    
-    // Save current state to redo stack
-    CanvasSnapshot* redoSnap = new CanvasSnapshot();
-    redoSnap->capture();
-    redoStack.push_back(redoSnap);
-    
-    // Capture current layer count before restore
-    int oldLayerCount = layerCount;
 
-    // Restore from undo stack
-    CanvasSnapshot* undoSnap = undoStack.back();
-    undoStack.pop_back();
-    undoSnap->restore();
-    
-    // Mark all layers as dirty after restore
-    for(int i=0; i<MAX_LAYERS; i++) layerDirty[i] = true;
-    
-    // Check for layer count mismatch (deleted or added layers)
-    if (layerCount > oldLayerCount) {
-        // Layers were restored (undoing a deletion)
-        // We need to tell the server to add these layers back
-        for (int i = oldLayerCount; i < layerCount; i++) {
-            printf("[Client][Undo] Restoring deleted layer %d\n", i);
-            ignore_layer_add++;
-            send_tcp_add_layer();
-            // Small delay to ensure server processes ADD before SYNC
-            usleep(50000); 
-        }
-    } else if (layerCount < oldLayerCount) {
-        // Layers were removed (undoing an addition)
-        // We need to tell the server to delete these layers
-        // Delete from top down to avoid index shifting issues
-        for (int i = oldLayerCount - 1; i >= layerCount; i--) {
-            printf("[Client][Undo] Removing added layer %d\n", i);
-            ignore_layer_del++;
-            send_tcp_delete_layer(i);
-            usleep(50000);
-        }
+    // Check Timeout
+    uint32_t now = SDL_GetTicks();
+    if (now - lastActionTime > UNDO_TIMEOUT_MS) {
+        printf("[Client] Undo expired! (Time limit exceeded)\n");
+        // Optional: Clear stack to prevent confusion?
+        // clear_undo_stack(); 
+        return;
     }
 
-    delete undoSnap;
+    // 1. Get last command
+    Command* cmd = undoStack.back();
+    undoStack.pop_back();
+
+    // 2. Execute Undo Logic
+    cmd->undo(); 
+    // This calls local memcpy AND sends result to server via TCP
     
-    // Sync changes to other clients
-    send_all_layers_sync();
+    // 3. Move to Redo Stack
+    redoStack.push_back(cmd);
     
-    // Clamp currentLayerId to valid range
-    if (currentLayerId >= layerCount) currentLayerId = layerCount - 1;
-    if (currentLayerId < 1 && layerCount > 1) currentLayerId = 1;
+    // Mark layer as dirty
+    for(int i=0; i<MAX_LAYERS; i++) {
+        layerIsDirty[i] = true;
+        layerDirtyRects[i] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
+    }
     
-    pendingLayerUpdate = true;
-    
-    printf("[Client][Undo] Undo performed (undo stack: %zu, redo stack: %zu)\n", 
-           undoStack.size(), redoStack.size());
+    printf("[Client] Undid action.\n");
+    lastActionTime = now; // Reset timer on action
 }
 
 void perform_redo() {
     if (redoStack.empty()) {
-        printf("[Client][Redo] Nothing to redo\n");
+        printf("[Client] Nothing to redo.\n");
         return;
     }
-    
-    // Save current state to undo stack
-    CanvasSnapshot* undoSnap = new CanvasSnapshot();
-    undoSnap->capture();
-    undoStack.push_back(undoSnap);
-    
-    // Capture current layer count before restore
-    int oldLayerCount = layerCount;
 
-    // Restore from redo stack
-    CanvasSnapshot* redoSnap = redoStack.back();
+    // 1. Get command
+    Command* cmd = redoStack.back();
     redoStack.pop_back();
-    redoSnap->restore();
-    
-    // Mark all layers as dirty after restore
-    for(int i=0; i<MAX_LAYERS; i++) layerDirty[i] = true;
 
-    // Check for layer count mismatch
-    if (layerCount > oldLayerCount) {
-        // Layers were restored (redoing an addition)
-        for (int i = oldLayerCount; i < layerCount; i++) {
-            printf("[Client][Redo] Restoring added layer %d\n", i);
-            ignore_layer_add++;
-            send_tcp_add_layer();
-            usleep(50000);
-        }
-    } else if (layerCount < oldLayerCount) {
-        // Layers were removed (redoing a deletion)
-        // Delete from top down to avoid index shifting issues
-        for (int i = oldLayerCount - 1; i >= layerCount; i--) {
-            printf("[Client][Redo] Removing deleted layer %d\n", i);
-            ignore_layer_del++;
-            send_tcp_delete_layer(i);
-            usleep(50000);
-        }
+    // 2. Execute Redo Logic
+    cmd->redo();
+    
+    // 3. Move back to Undo Stack
+    push_undo_command(cmd);
+
+    // Mark layer as dirty
+    for(int i=0; i<MAX_LAYERS; i++) {
+        layerIsDirty[i] = true;
+        layerDirtyRects[i] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
     }
 
-    delete redoSnap;
-    
-    // Sync changes to other clients
-    send_all_layers_sync();
-    
-    // Clamp currentLayerId to valid range
-    if (currentLayerId >= layerCount) currentLayerId = layerCount - 1;
-    if (currentLayerId < 1 && layerCount > 1) currentLayerId = 1;
-    
-    // Force UI update immediately to remove deleted layer buttons
-    pendingLayerUpdate = true;
-    UpdateLayerButtons();
-    
-    printf("[Client][Redo] Redo performed (undo stack: %zu, redo stack: %zu)\n", 
-           undoStack.size(), redoStack.size());
+    printf("[Client] Redid action.\n");
 }
 
 // --- MENU UI GLOBALS ---
@@ -1329,8 +1330,8 @@ struct MenuLayer {
 };
 std::vector<MenuLayer> menuLayers;
 SDL_Texture* menuTexture = nullptr;
-int menuWidth = CANVAS_WIDTH;
-int menuHeight = CANVAS_HEIGHT;
+int menuWidth = MENU_WIDTH;
+int menuHeight = MENU_HEIGHT;
 
 // Animation State
 uint32_t lastMenuAnimTime = 0;
@@ -1434,13 +1435,19 @@ void load_menu_ui() {
         vector<unsigned char> compressed = base64_decode(b64);
         vector<uint8_t> data = packbits_decompress(compressed);
         
+        // FIX: Check against MENU dimensions, not CANVAS dimensions
+        if (data.size() != MENU_WIDTH * MENU_HEIGHT * 4) {
+            pos = end;
+            continue;
+        }
+
         // Store Layer
         MenuLayer layer;
-        layer.pixels = new uint8_t[menuWidth * menuHeight * 4];
+        layer.pixels = new uint8_t[MENU_WIDTH * MENU_HEIGHT * 4];
         
         // Convert uint32_t (ABGR/RGBA) to uint8_t array
         uint32_t* src = (uint32_t*)data.data();
-        for (int i = 0; i < menuWidth * menuHeight; i++) {
+        for (int i = 0; i < MENU_WIDTH * MENU_HEIGHT; i++) {
             uint32_t p = src[i];
             // Assuming server format: R G B A (Big Endian packed) or similar
             // Adjust shifting based on your server's encode_layer.
@@ -1462,10 +1469,10 @@ void update_menu_texture() {
     if (menuLayers.empty()) return;
 
     // Allocate buffer
-    uint8_t* composite = new uint8_t[menuWidth * menuHeight * 4];
+    uint8_t* composite = new uint8_t[MENU_WIDTH * MENU_HEIGHT * 4];
     
     // 1. Fill with White (Background)
-    memset(composite, 255, menuWidth * menuHeight * 4);
+    memset(composite, 255, MENU_WIDTH * MENU_HEIGHT * 4);
 
     // 2. Define Layers to Draw
     // Static Base: Layers 1 to 12 (Indices 0 to 11 in vector)
@@ -1480,7 +1487,7 @@ void update_menu_texture() {
     auto blend = [&](int layerIdx) {
         if (layerIdx >= menuLayers.size()) return;
         uint8_t* src = menuLayers[layerIdx].pixels;
-        for (int i = 0; i < menuWidth * menuHeight * 4; i+=4) {
+        for (int i = 0; i < MENU_WIDTH * MENU_HEIGHT * 4; i+=4) {
             uint8_t srcA = src[i+3];
             if (srcA == 0) continue;
             
@@ -1503,9 +1510,9 @@ void update_menu_texture() {
     if (!menuTexture) {
         menuTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, 
                                       SDL_TEXTUREACCESS_STREAMING, 
-                                      menuWidth, menuHeight);
+                                      MENU_WIDTH, MENU_HEIGHT);
     }
-    SDL_UpdateTexture(menuTexture, NULL, composite, menuWidth * 4);
+    SDL_UpdateTexture(menuTexture, NULL, composite, MENU_WIDTH * 4);
     
     delete[] composite;
 }
@@ -1557,7 +1564,8 @@ void update_canvas_texture() {
                                                  CANVAS_WIDTH, CANVAS_HEIGHT);
             if (layerTextures[i]) {
                 SDL_SetTextureBlendMode(layerTextures[i], SDL_BLENDMODE_BLEND);
-                layerDirty[i] = true; // Force immediate upload
+                layerIsDirty[i] = true; // Force immediate upload
+                layerDirtyRects[i] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
                 printf("[Client][Main] Created GPU Texture for Layer %d\n", i);
             }
         }
@@ -1567,12 +1575,6 @@ void update_canvas_texture() {
             SDL_DestroyTexture(layerTextures[i]);
             layerTextures[i] = nullptr;
             printf("[Client][Main] Destroyed GPU Texture for Layer %d\n", i);
-        }
-
-        // Upload data if dirty
-        if (layers[i] && layerTextures[i] && layerDirty[i]) {
-            SDL_UpdateTexture(layerTextures[i], NULL, layers[i], CANVAS_WIDTH * 4);
-            layerDirty[i] = false;
         }
     }
 }
@@ -1661,13 +1663,22 @@ void download_as_bmp() {
 void init_brushes() {
     printf("[Client][Brushes] Initializing brush system...\n");
     
-    availableBrushes.push_back(new RoundBrush());
-    availableBrushes.push_back(new SquareBrush());
-    availableBrushes.push_back(new HardEraserBrush());
-    availableBrushes.push_back(new PressureBrush());
-    availableBrushes.push_back(new Airbrush());
-    availableBrushes.push_back(new RealPaintBrush());
-    availableBrushes.push_back(new SoftEraserBrush());
+    // Order must match constants:
+    // 0: Round
+    // 1: Square
+    // 2: Hard Eraser
+    // 3: Soft Eraser
+    // 4: Pressure
+    // 5: Airbrush
+    // 6: Texture
+    
+    availableBrushes.push_back(new RoundBrush());       // 0
+    availableBrushes.push_back(new SquareBrush());      // 1
+    availableBrushes.push_back(new HardEraserBrush());  // 2
+    availableBrushes.push_back(new SoftEraserBrush());  // 3
+    availableBrushes.push_back(new PressureBrush());    // 4
+    availableBrushes.push_back(new Airbrush());         // 5
+    availableBrushes.push_back(new TexturedBrush());    // 6
     
     for (int i = 0; i < (int)availableBrushes.size(); i++) {
         availableBrushes[i]->size = 15;
@@ -1750,7 +1761,8 @@ void move_layer_local(int layer_id, int dx, int dy) {
     // Copy back
     memcpy(layers[layer_id], temp, CANVAS_WIDTH * CANVAS_HEIGHT * 4);
     delete[] temp;
-    layerDirty[layer_id] = true;
+    layerIsDirty[layer_id] = true;
+    layerDirtyRects[layer_id] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
 }
 
 void handle_events() {
@@ -1793,43 +1805,61 @@ void handle_events() {
                         }
 
                         if (!uiClicked) {
-                            // CHECK CTRL KEY STATE FOR LAYER MOVE
-                            const Uint8* state = SDL_GetKeyboardState(NULL);
-                            if (state[SDL_SCANCODE_LCTRL] || state[SDL_SCANCODE_RCTRL]) {
-                                if (currentLayerId > 0) {
-                                    save_undo_state();
-                                    isMovingLayer = true;
-                                    totalMoveX = 0;
-                                    totalMoveY = 0;
-                                    lastMouseX = mx;
-                                    lastMouseY = my;
-                                    printf("[Client] Started Layer Move\n");
-                                }
-                            }
-                            // If eyedropper is active, pick color
-                            else if (isEyedropping) {
-                                if (mx >= 0 && mx < CANVAS_WIDTH && my >= 0 && my < CANVAS_HEIGHT) {
-                                    userColor = get_composite_pixel(mx, my);
-                                    isEyedropping = false; // Turn off after picking
-                                    printf("[Client][Tool] Picked color: %d,%d,%d\n", userColor.r, userColor.g, userColor.b);
-                                }
-                            } else {
-                                // Drawing on canvas - save undo state before starting stroke
-                                if (!strokeInProgress) {
-                                    save_undo_state();
-                                    strokeInProgress = true;
-                                }
-                                mouseDown = 1;
+                            // CHECK SPACE KEY FOR PANNING
+                            if (spacePressed) {
+                                isPanning = true;
                                 lastMouseX = mx;
                                 lastMouseY = my;
-                                
-                                // Initial pressure check
-                                int pressure = 255;
-                                if (use_raw_input) {
-                                    float p = RawInput_GetPressure();
-                                    if (p >= 0.0f) pressure = (int)(p * 255);
+                                printf("[Client] Started Panning\n");
+                            }
+                            // CHECK CTRL KEY STATE FOR LAYER MOVE
+                            else {
+                                const Uint8* state = SDL_GetKeyboardState(NULL);
+                                if (state[SDL_SCANCODE_LCTRL] || state[SDL_SCANCODE_RCTRL]) {
+                                    if (currentLayerId > 0) {
+                                        clear_redo_stack();
+                                        isMovingLayer = true;
+                                        totalMoveX = 0;
+                                        totalMoveY = 0;
+                                        lastMouseX = mx;
+                                        lastMouseY = my;
+                                        printf("[Client] Started Layer Move\n");
+                                    }
                                 }
-                                send_udp_draw(mx, my, pressure);
+                                // If eyedropper is active, pick color
+                                else if (isEyedropping) {
+                                    // Transform to Canvas Coords
+                                    int cx = mx - viewOffsetX;
+                                    int cy = my - viewOffsetY;
+                                    if (cx >= 0 && cx < CANVAS_WIDTH && cy >= 0 && cy < CANVAS_HEIGHT) {
+                                        userColor = get_composite_pixel(cx, cy);
+                                        isEyedropping = false; // Turn off after picking
+                                        printf("[Client][Tool] Picked color: %d,%d,%d\n", userColor.r, userColor.g, userColor.b);
+                                    }
+                                } else {
+                                    // Drawing on canvas - save undo state before starting stroke
+                                    if (!strokeInProgress) {
+                                        clear_redo_stack();
+                                        currentPaintCmd = new PaintCommand(currentLayerId, CANVAS_WIDTH, CANVAS_HEIGHT);
+                                        currentPaintCmd->captureBefore();
+                                        strokeInProgress = true;
+                                    }
+                                    mouseDown = 1;
+                                    lastMouseX = mx;
+                                    lastMouseY = my;
+                                    lastStableAngle = -999; // Reset angle state (Wait for motion)
+                                    
+                                    // Initial pressure check
+                                    int pressure = 255;
+                                    if (use_raw_input) {
+                                        float p = RawInput_GetPressure();
+                                        if (p >= 0.0f) pressure = (int)(p * 255);
+                                    }
+                                    
+                                    // NOTE: We do NOT draw immediately here.
+                                    // We wait for the first motion to determine angle.
+                                    // If no motion occurs (just a click), we handle it in MOUSEBUTTONUP.
+                                }
                             }
                         }
                     }
@@ -1860,28 +1890,19 @@ void handle_events() {
                 }
 
                 if (e.button.button == SDL_BUTTON_LEFT) {
-                    if (isMovingLayer) {
+                    if (isPanning) {
+                        isPanning = false;
+                        printf("[Client] Stopped Panning\n");
+                    }
+                    else if (isMovingLayer) {
                         // Finish Move: Send Command to Server
                         printf("[Client] Finished Move. Total Delta: (%d, %d)\n", totalMoveX, totalMoveY);
                         
                         if (totalMoveX != 0 || totalMoveY != 0) {
-                            if (tcpSock >= 0) {
-                                TCPMessage msg;
-                                memset(&msg, 0, sizeof(msg));
-                                msg.type = MSG_LAYER_MOVE;
-                                msg.canvas_id = currentCanvasId;
-                                msg.layer_id = currentLayerId;
-                                
-                                // Pack payload INSIDE msg.data
-                                struct MoveData { int dx; int dy; } payload = { totalMoveX, totalMoveY };
-                                memcpy(msg.data, &payload, sizeof(payload));
-                                msg.data_len = sizeof(payload); 
-                                
-                                // Send the fixed-size struct only
-                                if (send(tcpSock, &msg, sizeof(msg), 0) < 0) {
-                                    perror("[Client] Failed to send Layer Move");
-                                }
-                            }
+                            send_tcp_layer_move(currentLayerId, totalMoveX, totalMoveY);
+                            
+                            MoveCommand* cmd = new MoveCommand(currentLayerId, totalMoveX, totalMoveY);
+                            push_undo_command(cmd);
                         }
                         
                         isMovingLayer = false;
@@ -1893,6 +1914,17 @@ void handle_events() {
                     }
                     
                     if (mouseDown) {
+                        // If we never moved enough to establish an angle, draw a single dot now
+                        if (lastStableAngle == -999 && lastMouseX != -1) {
+                            int pressure = 255; // Default pressure for click
+                            send_udp_draw(lastMouseX - viewOffsetX, lastMouseY - viewOffsetY, pressure, 0);
+                        }
+
+                        if (currentPaintCmd) {
+                            currentPaintCmd->captureAfter();
+                            push_undo_command(currentPaintCmd);
+                            currentPaintCmd = nullptr;
+                        }
                         strokeInProgress = false;
                     }
                     mouseDown = 0;
@@ -1927,24 +1959,39 @@ void handle_events() {
                     // If finger down, start stroke
                     if (e.type == SDL_FINGERDOWN) {
                         if (!strokeInProgress) {
-                            save_undo_state();
+                            clear_redo_stack();
+                            currentPaintCmd = new PaintCommand(currentLayerId, CANVAS_WIDTH, CANVAS_HEIGHT);
+                            currentPaintCmd->captureBefore();
                             strokeInProgress = true;
                         }
                         mouseDown = 1; // Treat as mouse down
                         lastMouseX = mx;
                         lastMouseY = my;
+                        lastStableAngle = -999; // Reset angle
                     }
                     
-                    send_udp_cursor(mx, my);
+                    send_udp_cursor(mx - viewOffsetX, my - viewOffsetY);
                     
-                    if (mouseDown) {
+                    if (mouseDown && e.type != SDL_FINGERDOWN) {
                         // Interpolate
-                        int angle = 0;
+                        int angle = lastStableAngle;
                         if (lastMouseX >= 0 && lastMouseY >= 0) {
                             int dx = mx - lastMouseX;
                             int dy = my - lastMouseY;
-                            if (dx != 0 || dy != 0) {
-                                angle = (int)(atan2(dy, dx) * 180.0 / M_PI);
+                            float dist = sqrt(dx*dx + dy*dy);
+
+                            if (lastStableAngle == -999) {
+                                if (dist > 3.0f) {
+                                    lastStableAngle = (int)(atan2(dy, dx) * 180.0 / M_PI);
+                                    angle = lastStableAngle;
+                                } else {
+                                    break; // Pause
+                                }
+                            } else {
+                                if (dist > 3.0f) {
+                                    lastStableAngle = (int)(atan2(dy, dx) * 180.0 / M_PI);
+                                    angle = lastStableAngle;
+                                }
                             }
                             
                             int steps = max(abs(dx), abs(dy));
@@ -1952,20 +1999,31 @@ void handle_events() {
                                 for (int i = 1; i <= steps; i++) {
                                     int ix = lastMouseX + (dx * i) / steps;
                                     int iy = lastMouseY + (dy * i) / steps;
-                                    send_udp_draw(ix, iy, pressureInt, angle);
+                                    send_udp_draw(ix - viewOffsetX, iy - viewOffsetY, pressureInt, angle);
                                 }
                             }
                         }
                         lastMouseX = mx;
                         lastMouseY = my;
                         // Also draw at current position
-                        send_udp_draw(mx, my, pressureInt, angle);
+                        send_udp_draw(mx - viewOffsetX, my - viewOffsetY, pressureInt, angle);
                     }
                 }
                 break;
 
             case SDL_FINGERUP:
                 if (mouseDown) {
+                    // If we never moved enough to establish an angle, draw a single dot now
+                    if (lastStableAngle == -999 && lastMouseX != -1) {
+                        int pressure = 255; // Default pressure
+                        send_udp_draw(lastMouseX - viewOffsetX, lastMouseY - viewOffsetY, pressure, 0);
+                    }
+
+                    if (currentPaintCmd) {
+                        currentPaintCmd->captureAfter();
+                        push_undo_command(currentPaintCmd);
+                        currentPaintCmd = nullptr;
+                    }
                     strokeInProgress = false;
                 }
                 mouseDown = 0;
@@ -2017,7 +2075,15 @@ void handle_events() {
                     int mx = e.motion.x;
                     int my = e.motion.y;
                     
-                    if (isMovingLayer) {
+                    if (isPanning) {
+                        int dx = mx - lastMouseX;
+                        int dy = my - lastMouseY;
+                        viewOffsetX += dx;
+                        viewOffsetY += dy;
+                        lastMouseX = mx;
+                        lastMouseY = my;
+                    }
+                    else if (isMovingLayer) {
                         int dx = mx - lastMouseX;
                         int dy = my - lastMouseY;
                         
@@ -2061,20 +2127,24 @@ void handle_events() {
                     
                     // Continuous Eyedropper Update
                     if (isEyedropping) {
-                        if (mx >= 0 && mx < CANVAS_WIDTH && my >= 0 && my < CANVAS_HEIGHT) {
-                            userColor = get_composite_pixel(mx, my);
+                        // Transform to Canvas Coords
+                        int cx = mx - viewOffsetX;
+                        int cy = my - viewOffsetY;
+                        if (cx >= 0 && cx < CANVAS_WIDTH && cy >= 0 && cy < CANVAS_HEIGHT) {
+                            userColor = get_composite_pixel(cx, cy);
                         }
                     }
                     
                     if (loggedin && myUserId > 0) { // Only send if we know who we are
                         if (mx != lastSentX || my != lastSentY) {
-                            send_udp_cursor(mx, my);
+                            // Send Canvas Coords
+                            send_udp_cursor(mx - viewOffsetX, my - viewOffsetY);
                             lastSentX = mx;
                             lastSentY = my;
                         }
                     }
                     
-                    if (mouseDown) {
+                    if (mouseDown && !isPanning) {
                         // Standard mouse drawing (no pressure)
                         int pressure = 255;
 
@@ -2093,10 +2163,21 @@ void handle_events() {
                             // DISTANCE CHECK: Calculate how far we moved
                             float dist = sqrt(dx*dx + dy*dy);
                             
-                            // Only update the angle if we moved at least 3 pixels.
-                            // This prevents the "Star" artifact at start/end of lines.
-                            if (dist > 3.0f) {
-                                lastStableAngle = (int)(atan2(dy, dx) * 180.0 / M_PI);
+                            // PAUSE LOGIC: If we haven't established a direction yet...
+                            if (lastStableAngle == -999) {
+                                if (dist > 3.0f) {
+                                    // We moved enough! Set the angle.
+                                    lastStableAngle = (int)(atan2(dy, dx) * 180.0 / M_PI);
+                                } else {
+                                    // Not enough movement yet. Wait.
+                                    // Do NOT update lastMouseX, so we draw from the start point later.
+                                    break; 
+                                }
+                            } else {
+                                // Normal update
+                                if (dist > 3.0f) {
+                                    lastStableAngle = (int)(atan2(dy, dx) * 180.0 / M_PI);
+                                }
                             }
                             
                             // Use the stabilized angle
@@ -2108,17 +2189,18 @@ void handle_events() {
                                 for (int i = 1; i <= steps; i++) {
                                     int ix = lastMouseX + (dx * i) / steps;
                                     int iy = lastMouseY + (dy * i) / steps;
-                                    send_udp_draw(ix, iy, pressure, angle);
+                                    // Transform to Canvas Coords
+                                    send_udp_draw(ix - viewOffsetX, iy - viewOffsetY, pressure, angle);
                                 }
                             }
                             // Also draw at current position
                             lastMouseX = mx;
                             lastMouseY = my;
-                            send_udp_draw(mx, my, pressure, angle);
+                            send_udp_draw(mx - viewOffsetX, my - viewOffsetY, pressure, angle);
                         } else {
                             lastMouseX = mx;
                             lastMouseY = my;
-                            send_udp_draw(mx, my, pressure, lastStableAngle);
+                            // Don't draw if we don't have a previous point (shouldn't happen with new logic)
                         }
                     }
                 }
@@ -2135,6 +2217,8 @@ void handle_events() {
                 break;
 
             case SDL_KEYDOWN:
+                if (e.key.keysym.sym == SDLK_SPACE) spacePressed = true;
+
                 // --- CANVAS SELECTION (When in Menu) ---
                 if (!loggedin) {
                     // Allow typing numbers 0-9 to change canvas ID
@@ -2194,7 +2278,7 @@ void handle_events() {
                             for (int i = 0; i < MAX_LAYERS; i++) {
                                 if (layers[i]) { delete[] layers[i]; layers[i] = nullptr; }
                                 if (layerTextures[i]) { SDL_DestroyTexture(layerTextures[i]); layerTextures[i] = nullptr; }
-                                layerDirty[i] = false;
+                                layerIsDirty[i] = false;
                             }
                             // Re-init canvas defaults (Paper + 1 Transparent)
                             init_canvas(); 
@@ -2212,6 +2296,13 @@ void handle_events() {
                             // 5. Reset UI (Remove layer buttons)
                             UpdateLayerButtons();
                             pthread_mutex_unlock(&layerMutex);
+                            
+                            // --- RESIZE WINDOW TO MENU MODE ---
+                            SDL_SetWindowSize(window, MENU_WIDTH, MENU_HEIGHT);
+                            SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                            windowWidth = MENU_WIDTH;
+                            windowHeight = MENU_HEIGHT;
+                            SetupUI();
                             
                             printf("[Client] Logged out successfully.\n");
                         } else {
@@ -2296,30 +2387,55 @@ void handle_events() {
                 }
                 break;
 
+            case SDL_KEYUP:
+                if (e.key.keysym.sym == SDLK_SPACE) spacePressed = false;
+                break;
+
             default:
                 break;
         }
     }
 }
 
-void check_undo_expiration() {
-    time_t now = time(NULL);
-    while (!undoStack.empty()) {
-        if (difftime(now, undoStack.front()->timestamp) > 15.0) {
-            delete undoStack.front();
-            undoStack.erase(undoStack.begin());
-            // printf("[Client] Undo snapshot expired\n"); // Silent cleanup
-        } else {
-            break;
-        }
-    }
-}
+
 
 /*****************************************************************************
    MAIN
  *****************************************************************************/
 
+void process_dirty_updates() {
+    pthread_mutex_lock(&layerMutex); // Lock to prevent tearing
+
+    for (int i = 0; i < MAX_LAYERS; i++) {
+        if (layerIsDirty[i] && layerTextures[i]) {
+            SDL_Rect* r = &layerDirtyRects[i];
+            
+            // Convert Min/Max storage back to X/Y/W/H for SDL
+            // Current: x=minX, y=minY, w=maxX, h=maxY
+            int realW = r->w - r->x;
+            int realH = r->h - r->y;
+
+            if (realW > 0 && realH > 0) {
+                SDL_Rect updateRect = {r->x, r->y, realW, realH};
+                
+                // Calculate memory offset
+                // Pixels are stored as 1D array, we point to the top-left of the dirty rect
+                uint8_t* pixelStart = layers[i] + (r->y * CANVAS_WIDTH + r->x) * 4;
+                
+                SDL_UpdateTexture(layerTextures[i], &updateRect, pixelStart, CANVAS_WIDTH * 4);
+            }
+
+            // Reset for next frame
+            layerDirtyRects[i] = {CANVAS_WIDTH, CANVAS_HEIGHT, 0, 0};
+            layerIsDirty[i] = false;
+        }
+    }
+
+    pthread_mutex_unlock(&layerMutex);
+}
+
 int main(int argc, char* argv[]) {
+    init_dirty_rects();
     // Prevent crash when writing to closed socket
     signal(SIGPIPE, SIG_IGN);
 
@@ -2359,7 +2475,7 @@ int main(int argc, char* argv[]) {
 
     window = SDL_CreateWindow("Shared Canvas",
                               SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                              CANVAS_WIDTH, CANVAS_HEIGHT,
+                              MENU_WIDTH, MENU_HEIGHT,
                               SDL_WINDOW_SHOWN);
     if (!window) {
         printf("[Client][Main] SDL_CreateWindow failed: %s\n", SDL_GetError());
@@ -2486,7 +2602,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        check_undo_expiration();
+
         
         // Check for pending layer updates from TCP thread
         if (pendingLayerUpdate) {
@@ -2505,15 +2621,15 @@ int main(int argc, char* argv[]) {
             
             for (const auto& ps : toProcess) {
                 printf("[Client][Main] Processing pending signature for UID=%d...\n", ps.user_id);
-                // Reconstruct 30x10 surface (from 15x15 blocks)
-                SDL_Surface* surf = SDL_CreateRGBSurfaceWithFormat(0, 30, 10, 32, SDL_PIXELFORMAT_RGBA8888);
+                // Reconstruct 45x15 surface (from 10x10 blocks)
+                SDL_Surface* surf = SDL_CreateRGBSurfaceWithFormat(0, 45, 15, 32, SDL_PIXELFORMAT_RGBA8888);
                 if (surf) {
                     SDL_LockSurface(surf);
                     // Clear to transparent
-                    memset(surf->pixels, 0, 30 * 10 * 4);
+                    memset(surf->pixels, 0, 45 * 15 * 4);
                     
                     int setPixels = 0;
-                    for (int i = 0; i < 128; i++) {
+                    for (int i = 0; i < 256; i++) {
                         uint8_t byte = ps.data[i];
                         // 4 pixels per byte (2 bits each)
                         for (int p = 0; p < 4; p++) {
@@ -2522,13 +2638,13 @@ int main(int argc, char* argv[]) {
                             
                             if (val > 0) {
                                 int pixelIdx = i * 4 + p;
-                                int x = pixelIdx % 30;
-                                int y = pixelIdx / 30;
+                                int x = pixelIdx % 45;
+                                int y = pixelIdx / 45;
                                 
-                                if (x < 30 && y < 10) {
+                                if (x < 45 && y < 15) {
                                     uint8_t alpha = val * 85;
                                     Uint32 color = SDL_MapRGBA(surf->format, 255, 255, 255, alpha);
-                                    ((Uint32*)surf->pixels)[y * 30 + x] = color;
+                                    ((Uint32*)surf->pixels)[y * 45 + x] = color;
                                     setPixels++;
                                 }
                             }
@@ -2554,6 +2670,10 @@ int main(int argc, char* argv[]) {
         // --- SIGNATURE IMPLEMENTATION END ---
 
         update_canvas_texture();
+        
+        // --- NEW: UPLOAD TEXTURES TO GPU HERE ---
+        // This runs EXACTLY ONCE per frame, no matter how many brush steps happened.
+        process_dirty_updates(); 
 
         draw_ui(renderer, uiVisible, [&](SDL_Renderer* r) {
             // Render remote signatures attached to cursors
@@ -2611,8 +2731,10 @@ int main(int argc, char* argv[]) {
     for (auto* btn : buttons) delete btn;
     
     // Cleanup undo/redo stacks
-    for (auto* snap : undoStack) delete snap;
-    for (auto* snap : redoStack) delete snap;
+    for (auto* cmd : undoStack) delete cmd;
+    for (auto* cmd : redoStack) delete cmd;
+    undoStack.clear();
+    redoStack.clear();
     
     // Cleanup layer textures
     for (int i = 0; i < MAX_LAYERS; i++) {

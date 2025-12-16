@@ -18,6 +18,7 @@
 #include <cmath>
 #include <functional>
 #include "brushes.h"
+#include "undo.h"
 
 using namespace std;
 
@@ -41,6 +42,8 @@ extern SDL_Texture* signatureTexture;
 extern SDL_Rect signatureRect;
 extern SDL_Texture* menuTexture; 
 extern bool isDrawingSignature;
+extern int viewOffsetX;
+extern int viewOffsetY;
 
 struct RemoteCursor {
     int x, y;
@@ -56,12 +59,16 @@ extern void send_tcp_reorder_layer(int old_idx, int new_idx);
 extern void UpdateLayerButtons();
 extern void perform_undo();
 extern void perform_redo();
-extern void save_undo_state();
+extern void record_add_layer_command();
+extern void record_delete_layer_command(int layer_id);
 extern void download_as_bmp();
-extern vector<CanvasSnapshot*> redoStack;
+extern vector<Command*> redoStack;
 
-#define UI_WIDTH 640
-#define UI_HEIGHT 480
+// Dynamic UI Dimensions
+extern int windowWidth;
+extern int windowHeight;
+#define UI_WIDTH windowWidth
+#define UI_HEIGHT windowHeight
 
 // Drag state globals
 int dragLayerId = -1;
@@ -279,17 +286,26 @@ public:
             for (int i = -3; i <= 3; i++) for (int j = -3; j <= 3; j++) if (i*i + j*j <= 9) SDL_RenderDrawPoint(renderer, x+w/2+i, y+h/2+j);
         } else if (brushId == 1) { // Square
             SDL_Rect r = {x+w/2-3, y+h/2-3, 7, 7}; SDL_RenderFillRect(renderer, &r);
-        } else if (brushId == 2) { // Eraser
+        } else if (brushId == 2) { // Hard Eraser
             SDL_SetRenderDrawColor(renderer, 255, 200, 200, 255);
             SDL_Rect r = {x+w/2-4, y+h/2-4, 9, 9}; SDL_RenderFillRect(renderer, &r);
             SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderDrawRect(renderer, &r);
-        } else if (brushId == 3) { // Pressure (P)
+        } else if (brushId == 3) { // Soft Eraser
+            SDL_SetRenderDrawColor(renderer, 255, 200, 200, 255);
+            for(int i=-2; i<=2; i++) for(int j=-2; j<=2; j++) if(i*i+j*j<=5) SDL_RenderDrawPoint(renderer, x+w/2+i, y+h/2+j);
+            SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        } else if (brushId == 4) { // Pressure (P)
             int cx = x+w/2, cy = y+h/2;
             SDL_RenderDrawLine(renderer, cx-2, cy-4, cx-2, cy+4); SDL_RenderDrawLine(renderer, cx-2, cy-4, cx+2, cy-4);
             SDL_RenderDrawLine(renderer, cx+2, cy-4, cx+2, cy); SDL_RenderDrawLine(renderer, cx-2, cy, cx+2, cy);
-        } else if (brushId == 4) { // Air (A)
+        } else if (brushId == 5) { // Air (A)
             int cx = x+w/2, cy = y+h/2;
             SDL_RenderDrawLine(renderer, cx, cy-5, cx-3, cy+5); SDL_RenderDrawLine(renderer, cx, cy-5, cx+3, cy+5); SDL_RenderDrawLine(renderer, cx-2, cy, cx+2, cy);
+        } else if (brushId == 6) { // Textured (Real Paint R)
+            int cx = x+w/2, cy = y+h/2;
+            SDL_RenderDrawLine(renderer, cx-3, cy-3, cx+3, cy+3);
+            SDL_RenderDrawLine(renderer, cx-2, cy-3, cx+3, cy+2);
+            SDL_RenderDrawLine(renderer, cx-3, cy-2, cx+2, cy+3);
         }
     }
     virtual void Click() override { currentBrushId = brushId; }
@@ -357,7 +373,7 @@ public:
         int cx = x+w/2, cy = y+h/2;
         SDL_RenderDrawLine(renderer, cx-4, cy, cx+4, cy); SDL_RenderDrawLine(renderer, cx, cy-4, cx, cy+4);
     }
-    virtual void Click() override { save_undo_state(); send_tcp_add_layer(); }
+    virtual void Click() override { record_add_layer_command(); send_tcp_add_layer(); }
 };
 
 class DeleteLayerButton : public Button {
@@ -368,7 +384,7 @@ public:
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
         int cx = x+w/2, cy = y+h/2; SDL_RenderDrawLine(renderer, cx-4, cy, cx+4, cy);
     }
-    virtual void Click() override { if (layerCount > 2 && currentLayerId > 0) { save_undo_state(); send_tcp_delete_layer(currentLayerId); } }
+    virtual void Click() override { if (layerCount > 2 && currentLayerId > 0) { record_delete_layer_command(currentLayerId); send_tcp_delete_layer(currentLayerId); } }
 };
 
 class UndoButton : public Button {
@@ -434,13 +450,13 @@ public:
 };
 
 // Indices
-#define SAVE_BTN_IDX 13
-#define ADD_LAYER_BTN_IDX 14
-#define DEL_LAYER_BTN_IDX 15
-#define UNDO_BTN_IDX 16
-#define REDO_BTN_IDX 17
-#define EYEDROPPER_BTN_IDX 18
-#define LAYER_BUTTONS_START 19
+#define SAVE_BTN_IDX 15
+#define ADD_LAYER_BTN_IDX 16
+#define DEL_LAYER_BTN_IDX 17
+#define UNDO_BTN_IDX 18
+#define REDO_BTN_IDX 19
+#define EYEDROPPER_BTN_IDX 20
+#define LAYER_BUTTONS_START 21
 
 inline void UpdateLayerButtons() {
     while (buttons.size() > LAYER_BUTTONS_START) { delete buttons.back(); buttons.pop_back(); }
@@ -461,9 +477,12 @@ inline void SetupUI() {
 
     // === PART 1: MAIN MENU (KEEP YOUR HAND DRAWN ART) ===
     // Coordinates matched to your art
+    // Use MENU_WIDTH (640) for centering logic
+    int menuW = 640; 
+    
     LoginButton* loginBtn = new LoginButton();
     loginBtn->w = 220; loginBtn->h = 100;
-    loginBtn->x = (UI_WIDTH / 2) - (loginBtn->w / 2); loginBtn->y = 330;
+    loginBtn->x = (menuW / 2) - (loginBtn->w / 2); loginBtn->y = 330;
     buttons.push_back(loginBtn); // 0
 
     LobbyLeftButton* leftBtn = new LobbyLeftButton();
@@ -493,6 +512,8 @@ inline void SetupUI() {
     BrushButton* b3 = new BrushButton(); b3->x = 10; b3->y = 260; b3->w = 30; b3->h = 30; b3->brushId = 2; buttons.push_back(b3);
     BrushButton* b4 = new BrushButton(); b4->x = 10; b4->y = 295; b4->w = 30; b4->h = 30; b4->brushId = 3; buttons.push_back(b4);
     BrushButton* b5 = new BrushButton(); b5->x = 10; b5->y = 330; b5->w = 30; b5->h = 30; b5->brushId = 4; buttons.push_back(b5);
+    BrushButton* b6 = new BrushButton(); b6->x = 10; b6->y = 365; b6->w = 30; b6->h = 30; b6->brushId = 5; buttons.push_back(b6);
+    BrushButton* b7 = new BrushButton(); b7->x = 10; b7->y = 400; b7->w = 30; b7->h = 30; b7->brushId = 6; buttons.push_back(b7);
 
     SaveButton* saveBtn = new SaveButton(); saveBtn->x = UI_WIDTH/2 - 25; saveBtn->y = 10; saveBtn->w = 50; saveBtn->h = 30; buttons.push_back(saveBtn);
 
@@ -508,14 +529,18 @@ inline void SetupUI() {
 }
 
 inline void draw_ui(SDL_Renderer* renderer, bool uiVisible, std::function<void(SDL_Renderer*)> postCanvasCallback = nullptr) {
-    SDL_SetRenderDrawColor(renderer, 200, 200, 200, 255);
+    // 1. Clear with dark grey (The Void)
+    SDL_SetRenderDrawColor(renderer, 50, 50, 50, 255);
     SDL_RenderClear(renderer);
 
     if (!loggedin) {
         // --- DRAW MAIN MENU (KEEP EXACTLY AS IS) ---
+        // Use fixed 640x480 rect for menu texture
+        SDL_Rect menuRect = {0, 0, 640, 480};
+        
         if (menuTexture) {
             SDL_SetTextureBlendMode(menuTexture, SDL_BLENDMODE_NONE);
-            SDL_RenderCopy(renderer, menuTexture, NULL, NULL);
+            SDL_RenderCopy(renderer, menuTexture, NULL, &menuRect);
         } else {
             SDL_SetRenderDrawColor(renderer, 50, 50, 50, 255);
             SDL_RenderClear(renderer);
@@ -529,20 +554,25 @@ inline void draw_ui(SDL_Renderer* renderer, bool uiVisible, std::function<void(S
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
         int digit1 = currentCanvasId / 10;
         int digit2 = currentCanvasId % 10;
-        draw_digit_thick(renderer, digit1, UI_WIDTH/2 - 25, 55, 20); 
-        draw_digit_thick(renderer, digit2, UI_WIDTH/2 + 5, 55, 20);
+        // Center digits in 640 width
+        draw_digit_thick(renderer, digit1, 640/2 - 25, 55, 20); 
+        draw_digit_thick(renderer, digit2, 640/2 + 5, 55, 20);
         
         SDL_RenderPresent(renderer);
         return;
     }
 
     // --- DRAW CANVAS UI (RESTORED OLD STYLE) ---
+    
+    // 2. Define Viewport (The Canvas Position)
+    SDL_Rect destRect = {viewOffsetX, viewOffsetY, UI_WIDTH, UI_HEIGHT};
+
     // Draw Canvas Layers
-    if (canvasTexture) SDL_RenderCopy(renderer, canvasTexture, NULL, NULL);
+    if (canvasTexture) SDL_RenderCopy(renderer, canvasTexture, NULL, &destRect);
     for (int i = 0; i < layerCount; i++) {
         if (layerTextures[i]) {
             SDL_SetTextureAlphaMod(layerTextures[i], layerOpacity[i]);
-            SDL_RenderCopy(renderer, layerTextures[i], NULL, NULL);
+            SDL_RenderCopy(renderer, layerTextures[i], NULL, &destRect);
         }
     }
     
@@ -550,10 +580,13 @@ inline void draw_ui(SDL_Renderer* renderer, bool uiVisible, std::function<void(S
         postCanvasCallback(renderer);
     }
 
-    // Draw Remote Cursors
+    // Draw Remote Cursors (Adjusted for View Offset)
     for (auto& [uid, c] : remote_cursors) {
+        int rx = c.x + viewOffsetX;
+        int ry = c.y + viewOffsetY;
         SDL_SetRenderDrawColor(renderer, c.color.r, c.color.g, c.color.b, 255);
-        SDL_Rect cr = {c.x - 5, c.y - 5, 10, 10}; SDL_RenderDrawRect(renderer, &cr);
+        SDL_RenderDrawLine(renderer, rx - 5, ry, rx + 5, ry);
+        SDL_RenderDrawLine(renderer, rx, ry - 5, rx, ry + 5);
     }
 
     // Draw UI Buttons (Skip first 3 lobby buttons)
@@ -566,12 +599,27 @@ inline void draw_ui(SDL_Renderer* renderer, bool uiVisible, std::function<void(S
     // Brush Cursor
     int mx, my;
     SDL_GetMouseState(&mx, &my);
-    if (!isEyedropping && mx > 150 && mx < 550) { // Rough bounds check
+    
+    // Calculate Canvas Coordinates
+    int canvasX = mx - viewOffsetX;
+    int canvasY = my - viewOffsetY;
+
+    if (!isEyedropping) { 
+        // Draw cursor everywhere (even if off-canvas)
         if (currentBrushId >= 0 && currentBrushId < (int)availableBrushes.size()) {
             int size = availableBrushes[currentBrushId]->size;
             SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
             SDL_RenderDrawLine(renderer, mx - 5, my, mx + 5, my);
             SDL_RenderDrawLine(renderer, mx, my - 5, mx, my + 5);
+            
+            // Draw Brush Size Circle
+            int r = size / 2;
+            if (r > 2) {
+                for (int i = 0; i < 360; i += 10) {
+                    float rad = i * M_PI / 180.0f;
+                    SDL_RenderDrawPoint(renderer, mx + (int)(r * cos(rad)), my + (int)(r * sin(rad)));
+                }
+            }
         }
     }
 

@@ -78,17 +78,24 @@ public:
         float radius = effectiveDiameter / 2.0f; 
         if (radius < 0.5f) radius = 0.5f;
         int range = (int)ceil(radius) + 1;
+        
+        float featherRange = 1.5f;
+        float maxDist = radius + (featherRange / 2.0f);
+        float maxDist2 = maxDist * maxDist;
 
         for (int i = -range; i <= range; i++) {
+            int i2 = i * i;
             for (int j = -range; j <= range; j++) {
-                float dist = sqrt(i*i + j*j);
-                float featherRange = 1.5f; 
-                float delta = (radius - dist + (featherRange / 2.0f)) / featherRange;
-                if (delta > 0.0f) {
-                    if (delta > 1.0f) delta = 1.0f;
-                    Pixel px = color;
-                    px.a = (uint8_t)(baseAlpha * delta);
-                    if (px.a > 0) setPixel(x + i, y + j, px);
+                float dist2 = i2 + j*j;
+                if (dist2 < maxDist2) {
+                    float dist = sqrt(dist2);
+                    float delta = (radius - dist + (featherRange / 2.0f)) / featherRange;
+                    if (delta > 0.0f) {
+                        if (delta > 1.0f) delta = 1.0f;
+                        Pixel px = color;
+                        px.a = (uint8_t)(baseAlpha * delta);
+                        if (px.a > 0) setPixel(x + i, y + j, px);
+                    }
                 }
             }
         }
@@ -104,10 +111,14 @@ public:
         if (effectiveSize < 1) effectiveSize = 1;
         float pressureAlphaMod = 0.15f + 0.85f * p; 
         int r = effectiveSize; 
+        int r2 = r * r;
+
         for (int i = -r; i <= r; i++) {
+            int i2 = i * i;
             for (int j = -r; j <= r; j++) {
-                float dist = sqrt(i*i + j*j);
-                if (dist <= r) {
+                int dist2 = i2 + j*j;
+                if (dist2 <= r2) {
+                    float dist = sqrt(dist2);
                     float falloff = 1.0f - (dist / r);
                     falloff = falloff * falloff; 
                     float finalAlphaFloat = (color.a * opacity / 255.0f) * pressureAlphaMod * falloff;
@@ -123,7 +134,8 @@ public:
 // --- NEW / MODIFIED BRUSHES ---
 
 // 1. REAL PAINT BRUSH (Replaces the old textured brush)
-class RealPaintBrush : public Brush {
+// 4. TEXTURE BRUSH (Restored "Organic" Version)
+class TexturedBrush : public Brush {
     // A smoother bristle map. Lower numbers are gaps between bristles.
     const float bristles[32] = { 
         0.3f, 0.7f, 0.9f, 0.5f, 0.2f, 0.8f, 0.9f, 0.4f, 
@@ -196,10 +208,14 @@ public:
         float pressureMod = 0.1f + 0.9f * p; 
         
         int r = effectiveSize; 
+        int r2 = r * r;
+
         for (int i = -r; i <= r; i++) {
+            int i2 = i * i;
             for (int j = -r; j <= r; j++) {
-                float dist = sqrt(i*i + j*j);
-                if (dist <= r) {
+                int dist2 = i2 + j*j;
+                if (dist2 <= r2) {
+                    float dist = sqrt(dist2);
                     // Soft edges (Cubic falloff)
                     float falloff = 1.0f - (dist / r);
                     falloff = falloff * falloff * falloff;
