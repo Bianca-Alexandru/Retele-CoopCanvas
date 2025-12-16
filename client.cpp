@@ -266,7 +266,7 @@ vector<Brush*> availableBrushes;
 
 // Remote cursor tracking (forward declaration, defined in ui.h)
 struct RemoteCursor;
-map<string, RemoteCursor> remote_cursors;
+map<int, RemoteCursor> remote_cursors;
 
 // SDL
 SDL_Window* window = nullptr;
@@ -770,6 +770,23 @@ void* tcp_receiver_thread(void* arg) {
                msg.type, msg.canvas_id, msg.data_len);
 
         switch (msg.type) {
+            case MSG_LOGOUT:
+                printf("[Client][TCP-Thread] LOGOUT received for UID=%d\n", msg.user_id);
+                pthread_mutex_lock(&remoteClientsMutex);
+                // Remove signature
+                if (remoteClients.count(msg.user_id)) {
+                    if (remoteClients[msg.user_id].sigTexture) {
+                        SDL_DestroyTexture(remoteClients[msg.user_id].sigTexture);
+                    }
+                    remoteClients.erase(msg.user_id);
+                }
+                // Remove cursor
+                if (remote_cursors.count(msg.user_id)) {
+                    remote_cursors.erase(msg.user_id);
+                }
+                pthread_mutex_unlock(&remoteClientsMutex);
+                break;
+
             case MSG_WELCOME:
                 printf("[Client][TCP-Thread] WELCOME received! Canvas #%d, layers=%d, UID=%d\n", 
                        msg.canvas_id, msg.layer_count, msg.user_id);
@@ -1206,11 +1223,8 @@ void* udp_receiver_thread(void* arg) {
                             pthread_mutex_unlock(&remoteClientsMutex);
                         }
                         
-                        // Also update legacy remote_cursors map for compatibility if needed
-                        char key[32];
-                        snprintf(key, sizeof(key), "%s:%d", 
-                                 inet_ntoa(fromAddr.sin_addr), ntohs(fromAddr.sin_port));
-                        remote_cursors[key] = {pkt->x, pkt->y, {pkt->r, pkt->g, pkt->b, 255}};
+                        // Update remote_cursors map
+                        remote_cursors[uid] = {pkt->x, pkt->y, {pkt->r, pkt->g, pkt->b, 255}};
                     }
                     break;
 

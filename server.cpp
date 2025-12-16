@@ -1356,8 +1356,29 @@ void* tcp_client_session(void* arg) {
     if (client_canvas_id >= 0) {
         CanvasRoom* room = get_or_create_canvas(client_canvas_id);
         pthread_mutex_lock(&room->mutex);
+        
+        // 1. Find the user to get their UID
+        int user_uid = 0;
+        if (room->users.count(client_sock)) {
+            user_uid = room->users[client_sock]->room_uid;
+            room->remove_user(client_sock); // Clean up user data
+        }
+
+        // 2. Remove from TCP list
         auto& clients = room->tcp_clients;
         clients.erase(remove(clients.begin(), clients.end(), client_sock), clients.end());
+        
+        // 3. Broadcast LOGOUT
+        if (user_uid > 0) {
+            TCPMessage logoutMsg;
+            memset(&logoutMsg, 0, sizeof(logoutMsg));
+            logoutMsg.type = MSG_LOGOUT;
+            logoutMsg.canvas_id = client_canvas_id;
+            logoutMsg.user_id = user_uid;
+            broadcast_tcp(room, logoutMsg, client_sock);
+            printf("[Server][TCP] Broadcast LOGOUT for UID=%d\n", user_uid);
+        }
+
         printf("[Server][TCP] Removed socket %d from canvas #%d\n", client_sock, client_canvas_id);
         pthread_mutex_unlock(&room->mutex);
     }

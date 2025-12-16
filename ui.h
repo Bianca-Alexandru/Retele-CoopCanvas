@@ -49,7 +49,7 @@ struct RemoteCursor {
     int x, y;
     SDL_Color color;
 };
-extern map<string, RemoteCursor> remote_cursors;
+extern map<int, RemoteCursor> remote_cursors;
 
 extern void send_tcp_login(const char* username);
 extern void send_tcp_save();
@@ -92,43 +92,46 @@ extern vector<Button*> buttons;
 
 // --- HELPERS ---
 
-// Standard digit drawing (For Layer Numbers)
-inline void draw_digit(SDL_Renderer* renderer, int digit, int x, int y, int size) {
-    int w = size, h = size * 2;
-    bool segs[10][7] = {
-        {1,1,1,1,1,1,0}, {0,1,1,0,0,0,0}, {1,1,0,1,1,0,1}, {1,1,1,1,0,0,1}, {0,1,1,0,0,1,1},
-        {1,0,1,1,0,1,1}, {1,0,1,1,1,1,1}, {1,1,1,0,0,0,0}, {1,1,1,1,1,1,1}, {1,1,1,1,0,1,1}
-    };
-    if (digit < 0 || digit > 9) return;
-    if (segs[digit][0]) SDL_RenderDrawLine(renderer, x, y, x+w, y);
-    if (segs[digit][1]) SDL_RenderDrawLine(renderer, x+w, y, x+w, y+h/2);
-    if (segs[digit][2]) SDL_RenderDrawLine(renderer, x+w, y+h/2, x+w, y+h);
-    if (segs[digit][3]) SDL_RenderDrawLine(renderer, x, y+h, x+w, y+h);
-    if (segs[digit][4]) SDL_RenderDrawLine(renderer, x, y+h/2, x, y+h);
-    if (segs[digit][5]) SDL_RenderDrawLine(renderer, x, y, x, y+h/2);
-    if (segs[digit][6]) SDL_RenderDrawLine(renderer, x, y+h/2, x+w, y+h/2);
-}
+// Unified number drawing (Thick, White, Centered)
+inline void draw_number(SDL_Renderer* renderer, int number, int x, int y, int size) {
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); // Always White
+    
+    auto draw_digit_internal = [&](int d, int dx, int dy) {
+        int w = size, h = size * 2;
+        bool segs[10][7] = {
+            {1,1,1,1,1,1,0}, {0,1,1,0,0,0,0}, {1,1,0,1,1,0,1}, {1,1,1,1,0,0,1}, {0,1,1,0,0,1,1},
+            {1,0,1,1,0,1,1}, {1,0,1,1,1,1,1}, {1,1,1,0,0,0,0}, {1,1,1,1,1,1,1}, {1,1,1,1,0,1,1}
+        };
+        if (d < 0 || d > 9) return;
+        
+        auto draw_thick = [&](int x1, int y1, int x2, int y2) {
+            SDL_RenderDrawLine(renderer, x1, y1, x2, y2);
+            if (x1 == x2) { // Vertical
+                SDL_RenderDrawLine(renderer, x1-1, y1, x2-1, y2); 
+                SDL_RenderDrawLine(renderer, x1+1, y1, x2+1, y2); 
+            } else { // Horizontal
+                SDL_RenderDrawLine(renderer, x1, y1-1, x2, y2-1); 
+                SDL_RenderDrawLine(renderer, x1, y1+1, x2, y2+1); 
+            }
+        };
 
-// Thick digit drawing (For Main Menu Canvas ID)
-inline void draw_digit_thick(SDL_Renderer* renderer, int digit, int x, int y, int size) {
-    int w = size, h = size * 2;
-    bool segs[10][7] = {
-        {1,1,1,1,1,1,0}, {0,1,1,0,0,0,0}, {1,1,0,1,1,0,1}, {1,1,1,1,0,0,1}, {0,1,1,0,0,1,1},
-        {1,0,1,1,0,1,1}, {1,0,1,1,1,1,1}, {1,1,1,0,0,0,0}, {1,1,1,1,1,1,1}, {1,1,1,1,0,1,1}
+        if (segs[d][0]) draw_thick(dx, dy, dx+w, dy);
+        if (segs[d][1]) draw_thick(dx+w, dy, dx+w, dy+h/2);
+        if (segs[d][2]) draw_thick(dx+w, dy+h/2, dx+w, dy+h);
+        if (segs[d][3]) draw_thick(dx, dy+h, dx+w, dy+h);
+        if (segs[d][4]) draw_thick(dx, dy+h/2, dx, dy+h);
+        if (segs[d][5]) draw_thick(dx, dy, dx, dy+h/2);
+        if (segs[d][6]) draw_thick(dx, dy+h/2, dx+w, dy+h/2);
     };
-    if (digit < 0 || digit > 9) return;
-    auto draw_thick = [&](int x1, int y1, int x2, int y2) {
-        SDL_RenderDrawLine(renderer, x1, y1, x2, y2);
-        if (x1 == x2) { SDL_RenderDrawLine(renderer, x1-1, y1, x2-1, y2); SDL_RenderDrawLine(renderer, x1+1, y1, x2+1, y2); } 
-        else { SDL_RenderDrawLine(renderer, x1, y1-1, x2, y2-1); SDL_RenderDrawLine(renderer, x1, y1+1, x2, y2+1); }
-    };
-    if (segs[digit][0]) draw_thick(x, y, x+w, y);
-    if (segs[digit][1]) draw_thick(x+w, y, x+w, y+h/2);
-    if (segs[digit][2]) draw_thick(x+w, y+h/2, x+w, y+h);
-    if (segs[digit][3]) draw_thick(x, y+h, x+w, y+h);
-    if (segs[digit][4]) draw_thick(x, y+h/2, x, y+h);
-    if (segs[digit][5]) draw_thick(x, y, x, y+h/2);
-    if (segs[digit][6]) draw_thick(x, y+h/2, x+w, y+h/2);
+
+    if (number < 10) {
+        draw_digit_internal(number, x - size/2, y - size);
+    } else {
+        int d1 = number / 10;
+        int d2 = number % 10;
+        draw_digit_internal(d1, x - size - 2, y - size);
+        draw_digit_internal(d2, x + 2, y - size);
+    }
 }
 
 // Helper to check button clicks
@@ -271,29 +274,29 @@ public:
     
     virtual void Draw(SDL_Renderer* renderer) override {
         if (currentBrushId == brushId) {
-            SDL_SetRenderDrawColor(renderer, 150, 150, 150, 255);
+            SDL_SetRenderDrawColor(renderer, 150, 50, 200, 255); // Selected: Purple
         } else {
-            SDL_SetRenderDrawColor(renderer, 220, 220, 220, 255);
+            SDL_SetRenderDrawColor(renderer, 60, 60, 80, 255); // Unselected: Grayish Dark Blue
         }
         SDL_Rect rect = {x, y, w, h};
         SDL_RenderFillRect(renderer, &rect);
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); // Border: White
         SDL_RenderDrawRect(renderer, &rect);
 
         // Icons
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); // Icons: White
         if (brushId == 0) { // Round
             for (int i = -3; i <= 3; i++) for (int j = -3; j <= 3; j++) if (i*i + j*j <= 9) SDL_RenderDrawPoint(renderer, x+w/2+i, y+h/2+j);
         } else if (brushId == 1) { // Square
             SDL_Rect r = {x+w/2-3, y+h/2-3, 7, 7}; SDL_RenderFillRect(renderer, &r);
         } else if (brushId == 2) { // Hard Eraser
-            SDL_SetRenderDrawColor(renderer, 255, 200, 200, 255);
+            SDL_SetRenderDrawColor(renderer, 255, 100, 150, 255); // Pink
             SDL_Rect r = {x+w/2-4, y+h/2-4, 9, 9}; SDL_RenderFillRect(renderer, &r);
-            SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderDrawRect(renderer, &r);
+            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); SDL_RenderDrawRect(renderer, &r);
         } else if (brushId == 3) { // Soft Eraser
-            SDL_SetRenderDrawColor(renderer, 255, 200, 200, 255);
+            SDL_SetRenderDrawColor(renderer, 255, 100, 150, 255); // Pink
             for(int i=-2; i<=2; i++) for(int j=-2; j<=2; j++) if(i*i+j*j<=5) SDL_RenderDrawPoint(renderer, x+w/2+i, y+h/2+j);
-            SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
         } else if (brushId == 4) { // Pressure (P)
             int cx = x+w/2, cy = y+h/2;
             SDL_RenderDrawLine(renderer, cx-2, cy-4, cx-2, cy+4); SDL_RenderDrawLine(renderer, cx-2, cy-4, cx+2, cy-4);
@@ -314,9 +317,9 @@ public:
 class SizeUpButton : public Button {
 public:
     virtual void Draw(SDL_Renderer* renderer) override {
-        SDL_SetRenderDrawColor(renderer, 100, 200, 100, 255);
+        SDL_SetRenderDrawColor(renderer, 255, 100, 150, 255); // Pink
         SDL_Rect rect = {x, y, w, h}; SDL_RenderFillRect(renderer, &rect);
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderDrawRect(renderer, &rect);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); SDL_RenderDrawRect(renderer, &rect);
         int cx = x+w/2, cy = y+h/2;
         SDL_RenderDrawLine(renderer, cx-5, cy, cx+5, cy); SDL_RenderDrawLine(renderer, cx, cy-5, cx, cy+5);
     }
@@ -326,9 +329,9 @@ public:
 class SizeDownButton : public Button {
 public:
     virtual void Draw(SDL_Renderer* renderer) override {
-        SDL_SetRenderDrawColor(renderer, 200, 100, 100, 255);
+        SDL_SetRenderDrawColor(renderer, 50, 100, 200, 255); // Blue
         SDL_Rect rect = {x, y, w, h}; SDL_RenderFillRect(renderer, &rect);
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderDrawRect(renderer, &rect);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); SDL_RenderDrawRect(renderer, &rect);
         int cx = x+w/2, cy = y+h/2;
         SDL_RenderDrawLine(renderer, cx-5, cy, cx+5, cy);
     }
@@ -341,7 +344,7 @@ public:
 class SaveButton : public Button {
 public:
     virtual void Draw(SDL_Renderer* renderer) override {
-        SDL_SetRenderDrawColor(renderer, 50, 150, 50, 255);
+        SDL_SetRenderDrawColor(renderer, 150, 50, 200, 255); // Purple
         SDL_Rect rect = {x, y, w, h}; SDL_RenderFillRect(renderer, &rect);
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
         SDL_Rect inner = {x+8, y+5, w-16, h-15}; SDL_RenderDrawRect(renderer, &inner);
@@ -355,11 +358,11 @@ public:
     int layerId;
     virtual void Draw(SDL_Renderer* renderer) override {
         int drawY = (dragLayerId == layerId) ? dragCurrentY - h/2 : y;
-        if (currentLayerId == layerId) SDL_SetRenderDrawColor(renderer, 100, 200, 100, 255);
-        else SDL_SetRenderDrawColor(renderer, 150, 150, 150, 255);
+        if (currentLayerId == layerId) SDL_SetRenderDrawColor(renderer, 150, 50, 200, 255); // Selected: Purple
+        else SDL_SetRenderDrawColor(renderer, 60, 60, 80, 255); // Unselected: Grayish Dark Blue
         SDL_Rect rect = {x, drawY, w, h}; SDL_RenderFillRect(renderer, &rect);
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderDrawRect(renderer, &rect);
-        draw_digit(renderer, layerDisplayIds[layerId], x + w/2, drawY + h/2, 10);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); SDL_RenderDrawRect(renderer, &rect);
+        draw_number(renderer, layerDisplayIds[layerId], x + w/2, drawY + h/2, 10);
     }
     virtual void Click() override { currentLayerId = layerId; }
 };
@@ -367,7 +370,7 @@ public:
 class AddLayerButton : public Button {
 public:
     virtual void Draw(SDL_Renderer* renderer) override {
-        SDL_SetRenderDrawColor(renderer, 100, 200, 100, 255);
+        SDL_SetRenderDrawColor(renderer, 255, 100, 150, 255); // Pink
         SDL_Rect rect = {x, y, w, h}; SDL_RenderFillRect(renderer, &rect);
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
         int cx = x+w/2, cy = y+h/2;
@@ -379,7 +382,7 @@ public:
 class DeleteLayerButton : public Button {
 public:
     virtual void Draw(SDL_Renderer* renderer) override {
-        SDL_SetRenderDrawColor(renderer, 200, 100, 100, 255);
+        SDL_SetRenderDrawColor(renderer, 50, 100, 200, 255); // Blue
         SDL_Rect rect = {x, y, w, h}; SDL_RenderFillRect(renderer, &rect);
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
         int cx = x+w/2, cy = y+h/2; SDL_RenderDrawLine(renderer, cx-4, cy, cx+4, cy);
@@ -390,9 +393,9 @@ public:
 class UndoButton : public Button {
 public:
     virtual void Draw(SDL_Renderer* renderer) override {
-        SDL_SetRenderDrawColor(renderer, 80, 80, 120, 255);
+        SDL_SetRenderDrawColor(renderer, 150, 50, 200, 255); // Purple
         SDL_Rect rect = {x, y, w, h}; SDL_RenderFillRect(renderer, &rect);
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderDrawRect(renderer, &rect);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); SDL_RenderDrawRect(renderer, &rect);
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
         int cx = x + w/2, cy = y + h/2;
         SDL_RenderDrawLine(renderer, cx + 8, cy, cx - 4, cy); // Arrow
@@ -406,9 +409,9 @@ class RedoButton : public Button {
 public:
     virtual void Draw(SDL_Renderer* renderer) override {
         if (redoStack.empty()) return;
-        SDL_SetRenderDrawColor(renderer, 80, 80, 120, 255);
+        SDL_SetRenderDrawColor(renderer, 150, 50, 200, 255); // Purple
         SDL_Rect rect = {x, y, w, h}; SDL_RenderFillRect(renderer, &rect);
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderDrawRect(renderer, &rect);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); SDL_RenderDrawRect(renderer, &rect);
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
         int cx = x + w/2, cy = y + h/2;
         SDL_RenderDrawLine(renderer, cx - 8, cy, cx + 4, cy);
@@ -421,7 +424,7 @@ public:
 class DownloadButton : public Button {
 public:
     virtual void Draw(SDL_Renderer* renderer) override {
-        SDL_SetRenderDrawColor(renderer, 150, 75, 0, 255);
+        SDL_SetRenderDrawColor(renderer, 150, 50, 200, 255); // Purple
         SDL_Rect rect = {x, y, w, h}; SDL_RenderFillRect(renderer, &rect);
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
         SDL_Rect inner = {x+10, y+5, w-20, h-15}; SDL_RenderDrawRect(renderer, &inner);
@@ -436,10 +439,10 @@ public:
 class EyedropperButton : public Button {
 public:
     virtual void Draw(SDL_Renderer* renderer) override {
-        if (isEyedropping) SDL_SetRenderDrawColor(renderer, 100, 100, 255, 255);
-        else SDL_SetRenderDrawColor(renderer, 200, 200, 200, 255);
+        if (isEyedropping) SDL_SetRenderDrawColor(renderer, 150, 50, 200, 255); // Active: Purple
+        else SDL_SetRenderDrawColor(renderer, 60, 60, 80, 255); // Inactive: Grayish Dark Blue
         SDL_Rect rect = {x, y, w, h}; SDL_RenderFillRect(renderer, &rect);
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderDrawRect(renderer, &rect);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); SDL_RenderDrawRect(renderer, &rect);
         int cx = x + w/2, cy = y + h/2;
         SDL_RenderDrawLine(renderer, cx-3, cy-3, cx+3, cy+3);
         SDL_RenderDrawLine(renderer, cx-3, cy-3, cx, cy-6);
@@ -529,8 +532,8 @@ inline void SetupUI() {
 }
 
 inline void draw_ui(SDL_Renderer* renderer, bool uiVisible, std::function<void(SDL_Renderer*)> postCanvasCallback = nullptr) {
-    // 1. Clear with dark grey (The Void)
-    SDL_SetRenderDrawColor(renderer, 50, 50, 50, 255);
+    // 1. Clear with dark grey (The Void) - Updated to Grayish Dark Blue
+    SDL_SetRenderDrawColor(renderer, 40, 40, 60, 255);
     SDL_RenderClear(renderer);
 
     if (!loggedin) {
@@ -542,7 +545,7 @@ inline void draw_ui(SDL_Renderer* renderer, bool uiVisible, std::function<void(S
             SDL_SetTextureBlendMode(menuTexture, SDL_BLENDMODE_NONE);
             SDL_RenderCopy(renderer, menuTexture, NULL, &menuRect);
         } else {
-            SDL_SetRenderDrawColor(renderer, 50, 50, 50, 255);
+            SDL_SetRenderDrawColor(renderer, 40, 40, 60, 255);
             SDL_RenderClear(renderer);
         }
 
@@ -555,8 +558,8 @@ inline void draw_ui(SDL_Renderer* renderer, bool uiVisible, std::function<void(S
         int digit1 = currentCanvasId / 10;
         int digit2 = currentCanvasId % 10;
         // Center digits in 640 width
-        draw_digit_thick(renderer, digit1, 640/2 - 25, 55, 20); 
-        draw_digit_thick(renderer, digit2, 640/2 + 5, 55, 20);
+        draw_number(renderer, digit1, 640/2 - 30, 80, 25); 
+        draw_number(renderer, digit2, 640/2 + 10, 80, 25);
         
         SDL_RenderPresent(renderer);
         return;
