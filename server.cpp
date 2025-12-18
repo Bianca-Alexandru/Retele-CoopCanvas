@@ -340,7 +340,11 @@ bool write_all(int sock, const void* data, size_t len) {
 void broadcast_tcp(CanvasRoom* room, const TCPMessage& msg, int exclude_sock = -1) {
     for (int sock : room->tcp_clients) {
         if (sock != exclude_sock) {
-            write(sock, &msg, sizeof(TCPMessage));
+            if (!write_all(sock, &msg, sizeof(TCPMessage))) {
+                // If write fails, we can't easily remove the client here without locking issues
+                // But the next read/write will likely fail and clean it up.
+                // For now, just ignore the error to prevent crashing.
+            }
         }
     }
 }
@@ -994,7 +998,7 @@ void send_canvas_to_client(int sock, int canvas_id) {
     printf("[Server][TCP] Sending canvas #%d to socket %d\n", canvas_id, sock);
     
     int layer_count = room->layers.size();
-    write(sock, &layer_count, sizeof(int));
+    write_all(sock, &layer_count, sizeof(int));
     printf("[Server][TCP] Sent layer_count: %d\n", layer_count);
     
     pthread_mutex_lock(&room->mutex);
@@ -1116,7 +1120,7 @@ void* tcp_client_session(void* arg) {
                 response.layer_count = room->layers.size();
                 response.user_id = my_uid;
                 
-                write(client_sock, &response, sizeof(TCPMessage));
+                write_all(client_sock, &response, sizeof(TCPMessage));
                 printf("[Server][TCP] Sent WELCOME (canvas=%d, layers=%d)\n", canvas_id, response.layer_count);
                 
                 // Send the actual canvas data to sync the new client
@@ -1133,7 +1137,7 @@ void* tcp_client_session(void* arg) {
                         sigMsg.data_len = 256;
                         sigMsg.user_id = user->room_uid;
                         memcpy(sigMsg.data, user->signature_data, 256);
-                        write(client_sock, &sigMsg, sizeof(TCPMessage));
+                        write_all(client_sock, &sigMsg, sizeof(TCPMessage));
                         printf("[Server][TCP] Sent existing signature of UID=%d to new client\n", user->room_uid);
                     }
                 }
@@ -1291,8 +1295,8 @@ void* tcp_client_session(void* arg) {
                             
                             for (int sock : room->tcp_clients) {
                                 if (sock != client_sock) {  // Don't send back to sender
-                                    write(sock, &broadcast, sizeof(TCPMessage));
-                                    write(sock, layer_data, layer_size);
+                                    write_all(sock, &broadcast, sizeof(TCPMessage));
+                                    write_all(sock, layer_data, layer_size);
                                 }
                             }
                             printf("[Server][TCP] Broadcast LAYER_SYNC to %zu other clients\n", 
@@ -1392,8 +1396,9 @@ void* tcp_client_session(void* arg) {
  *****************************************************************************/
 
 int main() {
+    signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent server crash on client disconnect
     printf("============================================\n");
-    printf("  Shared Canvas Server v4.0\n");
+    printf("  Co-op Canvas Server v4.0\n");
     printf("  Multi-Layer + On-Demand Canvases\n");
     printf("============================================\n\n");
     

@@ -25,5 +25,6 @@ USAGE
 
 2. Start one or more Clients:
    ./client [server_ip]
+   sudo ./client --nuclear        (if pen pressure doesn't get detected)
 
    //Port is hardcoded for ease of use

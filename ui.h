@@ -44,6 +44,7 @@ extern SDL_Texture* menuTexture;
 extern bool isDrawingSignature;
 extern int viewOffsetX;
 extern int viewOffsetY;
+extern pthread_mutex_t layerMutex;
 
 struct RemoteCursor {
     int x, y;
@@ -572,12 +573,15 @@ inline void draw_ui(SDL_Renderer* renderer, bool uiVisible, std::function<void(S
 
     // Draw Canvas Layers
     if (canvasTexture) SDL_RenderCopy(renderer, canvasTexture, NULL, &destRect);
+    
+    pthread_mutex_lock(&layerMutex);
     for (int i = 0; i < layerCount; i++) {
         if (layerTextures[i]) {
             SDL_SetTextureAlphaMod(layerTextures[i], layerOpacity[i]);
             SDL_RenderCopy(renderer, layerTextures[i], NULL, &destRect);
         }
     }
+    pthread_mutex_unlock(&layerMutex);
     
     if (postCanvasCallback) {
         postCanvasCallback(renderer);

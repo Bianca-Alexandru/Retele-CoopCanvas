@@ -1,22 +1,24 @@
 title Co-op Canvas Architecture
 
 # Define Participants
+
 participantgroup #lightgrey **Client Side**
-    actor User
-    participant "Raw Input Thread\n(Nuclear Option)" as RawInput
-    participant "Main Thread\n(UI/SDL)" as ClientMain
-    participant "TCP Receiver" as ClientTCP
-    participant "UDP Receiver" as ClientUDP
+actor User
+participant "Raw Input Thread\n(Nuclear Option)" as RawInput
+participant "Main Thread\n(UI/SDL)" as ClientMain
+participant "TCP Receiver" as ClientTCP
+participant "UDP Receiver" as ClientUDP
 end
 
 participantgroup #lightblue **Server Side**
-    participant "Server Main\n(Accept Loop)" as ServerMain
-    participant "TCP Client Thread\n(One per Client)" as ServerTCP
-    participant "UDP Canvas Thread\n(One per Canvas)" as ServerUDP
-    participant "Autosave Thread" as ServerSave
+participant "Server Main\n(Accept Loop)" as ServerMain
+participant "TCP Client Thread\n(One per Client)" as ServerTCP
+participant "UDP Canvas Thread\n(One per Canvas)" as ServerUDP
+participant "Autosave Thread" as ServerSave
 end
 
 # --- STARTUP & LOGIN FLOW ---
+
 ServerMain->ServerSave: Start Autosave Thread
 activate ServerSave
 
@@ -24,9 +26,9 @@ User->ClientMain: Starts App
 ClientMain->ClientMain: Setup UI & SDL
 
 opt --nuclear flag enabled
-    ClientMain->RawInput: Start Thread
-    activate RawInput
-    note right of RawInput: Polls /dev/input/event*\nUpdates atomic pressure
+ClientMain->RawInput: Start Thread
+activate RawInput
+note right of RawInput: Polls /dev/input/event*\nUpdates atomic pressure
 end
 
 User->ClientMain: Clicks "Login" (Canvas n)
@@ -44,35 +46,40 @@ ServerTCP->ServerUDP: Start Canvas Thread (if needed)
 activate ServerUDP
 ServerUDP->ServerUDP: Bind UDP Port 6770+n
 
-ServerTCP-->ClientMain: MSG_WELCOME (Layer Count)
+ServerTCP-->ClientMain: MSG_WELCOME (Layer Count, UID)
 ServerTCP-->ClientMain: MSG_CANVAS_DATA (Full Layer History)
 
 # --- SIGNATURE SYNC ---
+
 ClientMain->ServerTCP: MSG_SIGNATURE (256-byte Bitmap)
 ServerTCP->ServerTCP: Store Signature in User Struct
 ServerTCP->ClientTCP: Broadcast MSG_SIGNATURE (to ALL in room)
-ClientTCP->ClientMain: Store Remote Signature
+ClientTCP->ClientMain: Store & Tint Remote Signature
 
 ClientMain->ClientTCP: Start TCP Receiver Thread
 activate ClientTCP
-ClientMain->ClientUDP: Start UDP Receiver Thread (Port 6772)
+ClientMain->ClientUDP: Start UDP Receiver Thread (Port 6770+n)
 activate ClientUDP
 
 # --- DRAWING FLOW (UDP) ---
+
 note over User, ServerUDP: Real-time Drawing (UDP)
 
 User->ClientMain: Drag Mouse (Draw)
 opt --nuclear
-    ClientMain->RawInput: Read Atomic Pressure
+ClientMain->RawInput: Read Atomic Pressure
 end
 ClientMain->ClientMain: Apply Locally (Immediate Feedback)
-ClientMain->ServerUDP: MSG_DRAW (UDP Packet)
+ClientMain->ClientMain: Expand Dirty Rect
+ClientMain->ServerUDP: MSG_DRAW or MSG_LINE (UDP Packet)
 
 ServerUDP->ServerUDP: Update Server Pixel Array
-ServerUDP->ClientUDP: Broadcast MSG_DRAW (to other clients)
+ServerUDP->ClientUDP: Broadcast MSG_DRAW / MSG_LINE (to other clients)
 note right of ServerUDP: Sent to everyone EXCEPT sender
 
-ClientUDP->ClientMain: Update Remote Layer
+ClientUDP->ClientMain: Update Remote Layer (Bresenham)
+ClientUDP->ClientMain: Expand Dirty Rect
+ClientMain->ClientMain: process_dirty_updates() (Upload to VRAM)
 ClientMain->User: Render Frame
 
 #--- CURSOR SYNCHRONIZATION ---
@@ -81,17 +88,22 @@ note over User, ServerUDP: Cursor Synchronization (UDP)
 User->ClientMain: Move Mouse
 ClientMain->ClientMain: Check Deduplication (Delta Check)
 alt Position Changed
-    ClientMain->ServerUDP: MSG_CURSOR (UDP Packet)
-    ServerUDP->ClientUDP: Broadcast MSG_CURSOR (to other clients)
-    note right of ServerUDP: Sent to everyone EXCEPT sender
+ClientMain->ServerUDP: MSG_CURSOR (UDP Packet)
+ServerUDP->ClientUDP: Broadcast MSG_CURSOR (to other clients)
+note right of ServerUDP: Sent to everyone EXCEPT sender
 
-    ClientUDP->ClientMain: Update remote_cursors Map
-    ClientMain->User: Render Remote Cursors
+```
+ClientUDP->ClientMain: Update remote_cursors Map
+ClientMain->User: Render Remote Cursors (Tinted Signatures)
+
+```
+
 else Position Unchanged
-    ClientMain->ClientMain: Drop Packet (Optimization)
+ClientMain->ClientMain: Drop Packet (Optimization)
 end
 
 # --- LAYER MANAGEMENT FLOW (TCP) ---
+
 note over User, ServerTCP: Layer Operations (TCP)
 
 User->ClientMain: Click "Add Layer"
@@ -127,32 +139,33 @@ ServerTCP->ClientTCP: Broadcast MSG_LAYER_MOVE
 ClientTCP->ClientMain: Apply Offset Locally
 
 # --- UNDO / REDO SYNC FLOW ---
+
 note over User, ServerTCP: Undo/Redo Synchronization (TCP)
 
 User->ClientMain: Click "Undo" or "Redo"
-ClientMain->ClientMain: Pop Snapshot & Restore Local Pixels
+ClientMain->ClientMain: Restore Pixels from Command
 
 opt Layer Count Mismatch Detected
-    alt Layers Restored (Undo Deletion / Redo Addition)
-        ClientMain->ClientMain: Set ignore_layer_add++
-        ClientMain->ServerTCP: MSG_LAYER_ADD (Restore Layer)
-        ServerTCP->ClientTCP: Broadcast MSG_LAYER_ADD (to ALL)
-        ClientTCP->ClientTCP: Check ignore_layer_add > 0?
-        ClientTCP->ClientTCP: Yes -> Decrement & Ignore (Prevent Loop)
-    else Layers Removed (Undo Addition / Redo Deletion)
-        ClientMain->ClientMain: Set ignore_layer_del++
-        ClientMain->ServerTCP: MSG_LAYER_DEL (Remove Layer)
-        ServerTCP->ClientTCP: Broadcast MSG_LAYER_DEL (to ALL)
-        ClientTCP->ClientTCP: Check ignore_layer_del > 0?
-        ClientTCP->ClientTCP: Yes -> Decrement & Ignore (Prevent Loop)
-    end
+alt Layers Restored (Undo Deletion / Redo Addition)
+ClientMain->ClientMain: Set ignore_layer_add++
+ClientMain->ServerTCP: MSG_LAYER_ADD (Restore Layer)
+ServerTCP->ClientTCP: Broadcast MSG_LAYER_ADD (to ALL)
+ClientTCP->ClientTCP: Check ignore_layer_add > 0?
+ClientTCP->ClientTCP: Yes -> Decrement & Ignore
+else Layers Removed (Undo Addition / Redo Deletion)
+ClientMain->ClientMain: Set ignore_layer_del++
+ClientMain->ServerTCP: MSG_LAYER_DEL (Remove Layer)
+ServerTCP->ClientTCP: Broadcast MSG_LAYER_DEL (to ALL)
+ClientTCP->ClientTCP: Check ignore_layer_del > 0?
+ClientTCP->ClientTCP: Yes -> Decrement & Ignore
+end
 end
 
-note right of ClientMain: Always sync pixel data (changed or not)
-loop For Each Layer
-    ClientMain->ServerTCP: MSG_LAYER_SYNC (Pixel Data)
-    ServerTCP->ServerTCP: Update Server Layer State
-    ServerTCP->ClientTCP: Broadcast MSG_LAYER_SYNC (to OTHERS only)
+note right of ClientMain: Always sync pixel data
+loop For Each Modified Layer
+ClientMain->ServerTCP: MSG_LAYER_SYNC (Pixel Data)
+ServerTCP->ServerTCP: Update Server Layer State
+ServerTCP->ClientTCP: Broadcast MSG_LAYER_SYNC (to OTHERS only)
 end
 
 ClientMain->ClientMain: Clamp currentLayerId
@@ -160,41 +173,50 @@ ClientMain->ClientMain: Clamp currentLayerId
 # --- SAVE FLOW ---
 note over User, ServerSave: Persistence
 
-User->ClientMain: Click "Save"
+User->ClientMain: Click "Save" or Ctrl+S
 ClientMain->ServerTCP: MSG_SAVE
-ServerTCP->ServerSave: Trigger Save
-ServerSave->ServerSave: Write canvas.json (Base64)
+ServerTCP->ServerTCP: Lock canvases_mutex
+ServerTCP->ServerSave: Trigger save_all_canvases()
+ServerSave->ServerSave: Write canvas.json (PackBits/Base64)
+ServerTCP->ServerTCP: Unlock canvases_mutex
 
 # --- AUTOSAVE FLOW ---
+
 loop Every 60 Seconds
-    ServerSave->ServerSave: Lock Mutex
-    ServerSave->ServerSave: Write canvas.json
-    ServerSave->ServerSave: Unlock Mutex
+ServerSave->ServerSave: Lock Mutex
+ServerSave->ServerSave: Write canvas.json (Dirty Layers Only)
+ServerSave->ServerSave: Unlock Mutex
 end
 
 # --- DISCONNECT FLOW ---
-User->ClientMain: Close Window
+
+User->ClientMain: Close Window / ESC
 ClientMain->ServerTCP: Close Socket
 ServerTCP->ServerMain: Client Disconnected
 ServerTCP->ServerTCP: Remove from Lists
+ServerTCP->ClientTCP: Broadcast MSG_LOGOUT (to OTHERS)
 
 alt Server Crash / Shutdown
-    ServerTCP->ClientTCP: Connection Closed (recv <= 0)
-    ClientTCP->ClientMain: Set running = 0
-    ClientMain->User: App Closes
+ServerTCP->ClientTCP: Connection Closed (recv <= 0)
+ClientTCP->ClientMain: Set running = 0
+ClientMain->User: App Closes
 end
 
 # --- CLIENT-SIDE ACTIONS (Local) ---
+
 note over User, ClientMain: Local Actions (No Network)
 
 User->ClientMain: Select Color (Hue/Sat/Val)
 ClientMain->ClientMain: Update userColor
 
-User->ClientMain: Select Brush (Round/Square/Eraser)
+User->ClientMain: Eyedropper (Right-Click)
+ClientMain->ClientMain: Sample Composite Pixel
+
+User->ClientMain: Select Brush (1-7)
 ClientMain->ClientMain: Update currentBrushId
 
-User->ClientMain: Click "Size +" or "Size -"
-ClientMain->ClientMain: Update Brush Size
+User->ClientMain: Space + Drag
+ClientMain->ClientMain: Pan Canvas Viewport
 
 User->ClientMain: Click "Download"
 ClientMain->ClientMain: SDL_SaveBMP (Save to Disk)

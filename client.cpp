@@ -1,12 +1,4 @@
-/*
-   COOP CANVAS CLIENT TLDR
-   
-   -Thread for tcp and udp listening
-    -Main thread for UI and drawing
-    -Uses ui from ui.h and brushes from brushes.h
-    -Doesn't yet implement sdl text, everything is manually drawn for now
-    -TCP port at 6769 UDP port at 6770 + canvasID
-*/
+
 
 #include <SDL2/SDL.h>
 #include <iostream>
@@ -61,6 +53,7 @@ void print_tutorial_controls() {
     std::cout << " [Ctrl]+[Z]  Undo\n";
     std::cout << " [Ctrl]+[Y]  Redo\n";
     std::cout << " [Ctrl]+[S]  Save Canvas\n";
+    std::cout << " [Ctrl]+Drag Move Canvas\n";
     std::cout << " [Space]+Drag Pan Canvas\n";
     std::cout << "========================================\n";
     std::cout << "Happy Drawing!\n\n";
@@ -840,7 +833,7 @@ void* tcp_receiver_thread(void* arg) {
         }
 
         // printf("[Client][TCP-Thread] Received message: type=%d, canvas=%d, data_len=%d\n",
-               msg.type, msg.canvas_id, msg.data_len);
+        //        msg.type, msg.canvas_id, msg.data_len);
 
         switch (msg.type) {
             case MSG_LOGOUT:
@@ -862,12 +855,14 @@ void* tcp_receiver_thread(void* arg) {
 
             case MSG_WELCOME:
                 // printf("[Client][TCP-Thread] WELCOME received! Canvas #%d, layers=%d, UID=%d\n", 
-                       msg.canvas_id, msg.layer_count, msg.user_id);
+                //        msg.canvas_id, msg.layer_count, msg.user_id);
                 
                 print_tutorial_controls(); // Show controls on first login
 
                 loggedin = 1;
                 myUserId = msg.user_id;
+                
+                pthread_mutex_lock(&layerMutex);
                 layerCount = msg.layer_count > 0 ? msg.layer_count : 2;
                 currentLayerId = 1;
                 
@@ -878,6 +873,7 @@ void* tcp_receiver_thread(void* arg) {
                         // printf("[Client][TCP-Thread] Created layer %d\n", l);
                     }
                 }
+                pthread_mutex_unlock(&layerMutex);
                 
                 // Receive layer data from server (skip layer 0 which is white paper)
                 {
@@ -1021,7 +1017,7 @@ void* tcp_receiver_thread(void* arg) {
 
             case MSG_LAYER_DEL:
                 // printf("[Client][TCP-Thread] LAYER_DEL confirmed: deleted layer %d, new count=%d\n", 
-                       msg.layer_id, msg.layer_count);
+                //        msg.layer_id, msg.layer_count);
                 pthread_mutex_lock(&layerMutex);
                 
                 if (ignore_layer_del > 0) {
@@ -1599,7 +1595,7 @@ vector<uint8_t> packbits_decompress(const vector<uint8_t>& in) {
 void load_menu_ui() {
     // printf("[Client][UI] Loading ui.json...\n");
     FILE* f = fopen("ui.json", "r");
-    if (!f) { // printf("[Client][UI] ui.json not found!\n"); return; }
+    if (!f) { /* printf("[Client][UI] ui.json not found!\n"); */ return; }
     
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
@@ -1817,7 +1813,7 @@ void download_as_bmp() {
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
     char filename[128];
-    sn// printf(filename, sizeof(filename), "canvas_%04d%02d%02d_%02d%02d%02d.bmp",
+    snprintf(filename, sizeof(filename), "canvas_%04d%02d%02d_%02d%02d%02d.bmp",
              t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
              t->tm_hour, t->tm_min, t->tm_sec);
     
@@ -1954,6 +1950,63 @@ void move_layer_local(int layer_id, int dx, int dy) {
     layerDirtyRects[layer_id] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
 }
 
+void draw_brush(int x, int y, SDL_Color color, int size, int pressure, int angle) {
+    if (currentBrushId < 0 || currentBrushId >= (int)availableBrushes.size()) return;
+    
+    bool isEraser = (currentBrushId == BRUSH_ERASER_ID);
+    bool isSoftEraser = (currentBrushId == BRUSH_SOFT_ERASER_ID);
+    
+    availableBrushes[currentBrushId]->paint(x, y, color, size, pressure, angle,
+        [isEraser, isSoftEraser](int px, int py, SDL_Color c) {
+            if (px >= 0 && px < CANVAS_WIDTH && py >= 0 && py < CANVAS_HEIGHT) {
+                int idx = (py * CANVAS_WIDTH + px) * 4;
+                
+                if (isEraser) {
+                    layers[currentLayerId][idx]     = 0;
+                    layers[currentLayerId][idx + 1] = 0;
+                    layers[currentLayerId][idx + 2] = 0;
+                    layers[currentLayerId][idx + 3] = 0;
+                    mark_layer_dirty(currentLayerId, px, py, 1);
+                    return;
+                }
+
+                if (isSoftEraser) {
+                    uint8_t currentAlpha = layers[currentLayerId][idx + 3];
+                    uint8_t eraseStrength = c.a;
+                    if (currentAlpha > 0) {
+                        int newAlpha = (int)currentAlpha - (int)eraseStrength;
+                        if (newAlpha < 0) newAlpha = 0;
+                        layers[currentLayerId][idx + 3] = (uint8_t)newAlpha;
+                        mark_layer_dirty(currentLayerId, px, py, 1);
+                    }
+                    return;
+                }
+                
+                // Correct Alpha Blending (Accumulation)
+                uint8_t oldR = layers[currentLayerId][idx];
+                uint8_t oldG = layers[currentLayerId][idx + 1];
+                uint8_t oldB = layers[currentLayerId][idx + 2];
+                uint8_t oldA = layers[currentLayerId][idx + 3];
+
+                float sa = c.a / 255.0f;
+                float da = oldA / 255.0f;
+                float na = sa + da * (1.0f - sa);
+                
+                if (na > 0.0f) {
+                    float r = (c.r * sa + oldR * da * (1.0f - sa)) / na;
+                    float g = (c.g * sa + oldG * da * (1.0f - sa)) / na;
+                    float b = (c.b * sa + oldB * da * (1.0f - sa)) / na;
+                    
+                    layers[currentLayerId][idx]     = (uint8_t)min(255.0f, r);
+                    layers[currentLayerId][idx + 1] = (uint8_t)min(255.0f, g);
+                    layers[currentLayerId][idx + 2] = (uint8_t)min(255.0f, b);
+                    layers[currentLayerId][idx + 3] = (uint8_t)min(255.0f, na * 255.0f);
+                }
+                mark_layer_dirty(currentLayerId, px, py, 1);
+            }
+        });
+}
+
 void handle_events() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -2029,8 +2082,10 @@ void handle_events() {
                                     // Drawing on canvas - save undo state before starting stroke
                                     if (!strokeInProgress) {
                                         clear_redo_stack();
-                                        currentPaintCmd = new PaintCommand(currentLayerId, CANVAS_WIDTH, CANVAS_HEIGHT);
-                                        currentPaintCmd->captureBefore();
+                                        if (!currentPaintCmd) {
+                                            currentPaintCmd = new PaintCommand(currentLayerId, CANVAS_WIDTH, CANVAS_HEIGHT);
+                                            currentPaintCmd->captureBefore();
+                                        }
                                         strokeInProgress = true;
                                     }
                                     mouseDown = 1;
@@ -2143,7 +2198,7 @@ void handle_events() {
                     
                     // Debug pressure
                     // printf("[Client][Input] Finger Event: Type=%s, X=%d, Y=%d, Pressure=%.2f, DeviceID=%ld\n", 
-                        (e.type == SDL_FINGERDOWN) ? "DOWN" : "MOTION", mx, my, pressure, (long)e.tfinger.touchId);
+                    //     (e.type == SDL_FINGERDOWN) ? "DOWN" : "MOTION", mx, my, pressure, (long)e.tfinger.touchId);
                     
                     // If finger down, start stroke
                     if (e.type == SDL_FINGERDOWN) {
@@ -2550,6 +2605,9 @@ void handle_events() {
                     case SDLK_6:
                         currentBrushId = 5;
                         break;
+                    case SDLK_7:
+                        currentBrushId = 6;
+                        break;
                     case SDLK_LEFTBRACKET:
                         if (currentLayerId > 1) {
                             currentLayerId--;
@@ -2630,7 +2688,7 @@ int main(int argc, char* argv[]) {
     signal(SIGPIPE, SIG_IGN);
 
     // printf("[Client][Main] ==============================================\n");
-    // printf("[Client][Main] Shared Canvas Client Starting\n");
+    // printf("[Client][Main] Co-op Canvas Client Starting\n");
     // printf("[Client][Main] ==============================================\n");
     
     print_tutorial_intro(); // Show intro tutorial
@@ -2665,7 +2723,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    window = SDL_CreateWindow("Shared Canvas",
+    window = SDL_CreateWindow("Co-op Canvas",
                               SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                               MENU_WIDTH, MENU_HEIGHT,
                               SDL_WINDOW_SHOWN);
@@ -2789,7 +2847,7 @@ int main(int argc, char* argv[]) {
             if (abs(pressure - lastSentPressure) > 2 || (pressure == 0 && lastSentPressure > 0)) {
                 // Use last known mouse position
                 if (lastMouseX >= 0 && lastMouseY >= 0) {
-                    send_udp_draw(lastMouseX, lastMouseY, pressure);
+                    send_udp_draw(lastMouseX - viewOffsetX, lastMouseY - viewOffsetY, pressure);
                 }
             }
         }
@@ -2830,6 +2888,7 @@ int main(int argc, char* argv[]) {
                             
                             if (val > 0) {
                                 int pixelIdx = i * 4 + p;
+                                if (pixelIdx >= 675) break; // Optimization: Stop if we exceed 45x15
                                 int x = pixelIdx % 45;
                                 int y = pixelIdx / 45;
                                 

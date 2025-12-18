@@ -17,6 +17,7 @@
 
 // Global state
 static std::atomic<int> current_pressure(0);
+static std::atomic<int> max_pressure(4096);
 static std::atomic<bool> is_running(false);
 static pthread_t input_thread;
 static int device_fd = -1;
@@ -133,6 +134,13 @@ inline bool RawInput_Start(void) {
         ::printf("[RawInput] Try running with sudo?\n");
         free(dev_path);
         return false;
+    }
+
+    // Get max pressure for this device
+    struct input_absinfo absinfo;
+    if (ioctl(device_fd, EVIOCGABS(ABS_PRESSURE), &absinfo) >= 0) {
+        max_pressure = absinfo.maximum;
+        ::printf("[RawInput] Device max pressure: %d\n", (int)max_pressure);
     }
 
     free(dev_path);

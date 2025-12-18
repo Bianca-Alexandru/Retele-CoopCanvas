@@ -74,7 +74,8 @@ public:
         if (opacityCurve > 1.0f) opacityCurve = 1.0f;
         float baseAlpha = (color.a * opacity / 255.0f) * opacityCurve;
         
-        float effectiveDiameter = maxSize * (0.3f + 0.7f * p);
+        // Thinner at low pressure: 10% to 100%
+        float effectiveDiameter = maxSize * (0.1f + 0.9f * p);
         float radius = effectiveDiameter / 2.0f; 
         if (radius < 0.5f) radius = 0.5f;
         int range = (int)ceil(radius) + 1;
@@ -109,7 +110,9 @@ public:
         float p = pressure / 255.0f;
         int effectiveSize = (int)(size * (0.5f + 0.5f * p)); 
         if (effectiveSize < 1) effectiveSize = 1;
-        float pressureAlphaMod = 0.15f + 0.85f * p; 
+        
+        // Much lower alpha for accumulation (0.05 to 0.2)
+        float pressureAlphaMod = 0.05f + 0.15f * p; 
         int r = effectiveSize; 
         int r2 = r * r;
 
