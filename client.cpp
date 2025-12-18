@@ -164,7 +164,7 @@ bool isEyedropping = false; // New state for eyedropper tool
 
 // Undo Timeout
 uint32_t lastActionTime = 0;
-const uint32_t UNDO_TIMEOUT_MS = 100000; // 100 seconds for now (was 15000)
+const uint32_t UNDO_TIMEOUT_MS = 15000; // 15 sec
 
 // Viewport / Panning
 int viewOffsetX = 0;
@@ -1577,7 +1577,7 @@ void load_menu_ui() {
         for (int i = 0; i < MENU_WIDTH * MENU_HEIGHT; i++) {
             uint32_t p = src[i];
             // Assuming server format: R G B A (Big Endian packed) or similar
-            // Adjust shifting based on your server's encode_layer.
+            // Adjust shifting based on the server's encode_layer.
             // Server usually packs: (r<<24)|(g<<16)|(b<<8)|a
             int idx = i * 4;
             layer.pixels[idx]   = (p >> 24) & 0xFF; // R
