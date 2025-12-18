@@ -57,7 +57,6 @@ enum MsgType {
     MSG_ERROR = 9,
     MSG_LAYER_ADD = 10,
     MSG_LAYER_DEL = 11,
-    MSG_LAYER_SELECT = 12,
     MSG_LAYER_SYNC = 13,   // Full layer data sync (for undo/redo)
     MSG_LAYER_REORDER = 14, // Swap layers
     MSG_SIGNATURE = 15,      // New signature message
@@ -435,8 +434,8 @@ void handle_line(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& sen
     }
     
     Pixel col = {msg.r, msg.g, msg.b, msg.a};
-    printf("[Server][Canvas %d][UDP] LINE: client=%s from=(%d,%d) to=(%d,%d) layer=%d brush=%d\n",
-           canvas_id, client_key.c_str(), msg.x, msg.y, msg.ex, msg.ey, layer_idx, msg.brush_id);
+    // printf("[Server][Canvas %d][UDP] LINE: client=%s from=(%d,%d) to=(%d,%d) layer=%d brush=%d\n",
+    //        canvas_id, client_key.c_str(), msg.x, msg.y, msg.ex, msg.ey, layer_idx, msg.brush_id);
     
     pthread_mutex_lock(&room->mutex);
     room->dirty = true;
@@ -481,7 +480,7 @@ void handle_line(CanvasRoom* room, const UDPMessage& msg, const sockaddr_in& sen
     
     int bc = broadcast_udp(room, msg, sender_addr);
     pthread_mutex_unlock(&room->mutex);
-    printf("[Server][Canvas %d][UDP] LINE broadcast to %d clients\n", canvas_id, bc);
+    // printf("[Server][Canvas %d][UDP] LINE broadcast to %d clients\n", canvas_id, bc);
 }
 
 /*****************************************************************************

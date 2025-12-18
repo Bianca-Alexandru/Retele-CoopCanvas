@@ -17,7 +17,6 @@
 
 // Global state
 static std::atomic<int> current_pressure(0);
-static std::atomic<int> max_pressure(4096); // Default, will be updated
 static std::atomic<bool> is_running(false);
 static pthread_t input_thread;
 static int device_fd = -1;
@@ -53,10 +52,9 @@ inline char* find_tablet_device() {
             if (TEST_BIT(ABS_PRESSURE, absbit)) {
                 // Get pressure range
                 if (ioctl(fd, EVIOCGABS(ABS_PRESSURE), &absinfo) >= 0) {
-                    max_pressure = absinfo.maximum;
                     ::printf("[RawInput] >>> FOUND PRESSURE DEVICE: %s (%s) Max Pressure: %d\n", path, name, absinfo.maximum);
                 } else {
-                    ::printf("[RawInput] >>> FOUND PRESSURE DEVICE: %s (%s) (Could not read max pressure, using default 4096)\n", path, name);
+                    ::printf("[RawInput] >>> FOUND PRESSURE DEVICE: %s (%s) (Could not read max pressure)\n", path, name);
                 }
                 close(fd);
                 return strdup(path);

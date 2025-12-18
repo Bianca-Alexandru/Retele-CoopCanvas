@@ -9,6 +9,7 @@
 */
 
 #include <SDL2/SDL.h>
+#include <iostream>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +27,44 @@
 #include <csignal>
 
 using namespace std;
+
+// --- TUTORIAL FUNCTIONS ---
+bool tutorialShown = false;
+
+void print_tutorial_intro() {
+    std::cout << "\n";
+    std::cout << "========================================\n";
+    std::cout << "      WELCOME TO CO-OP CANVAS!          \n";
+    std::cout << "========================================\n";
+    std::cout << "Instructions:\n";
+    std::cout << "1. Sign your name in the box below.\n";
+    std::cout << "2. Use 0-9 keys to select a Canvas Room.\n";
+    std::cout << "3. Click 'Login' to join the session.\n";
+    std::cout << "========================================\n\n";
+}
+
+void print_tutorial_controls() {
+    if (tutorialShown) return;
+    tutorialShown = true;
+    
+    std::cout << "\n";
+    std::cout << "========================================\n";
+    std::cout << "      YOU ARE NOW LOGGED IN!            \n";
+    std::cout << "========================================\n";
+    std::cout << "Keyboard Shortcuts:\n";
+    std::cout << " [TAB]       Toggle UI Visibility\n";
+    std::cout << " [ESC]       Logout / Exit\n";
+    std::cout << " [1-7]       Select Brush (Round, Square, Eraser...)\n";
+    std::cout << " [Q] / [W]   Decrease / Increase Brush Size\n";
+    std::cout << " [A] / [S]   Decrease / Increase Opacity\n";
+    std::cout << " [ [ ] / [ ] ] Select Previous / Next Layer\n";
+    std::cout << " [Ctrl]+[Z]  Undo\n";
+    std::cout << " [Ctrl]+[Y]  Redo\n";
+    std::cout << " [Ctrl]+[S]  Save Canvas\n";
+    std::cout << " [Space]+Drag Pan Canvas\n";
+    std::cout << "========================================\n";
+    std::cout << "Happy Drawing!\n\n";
+}
 
 #include "brushes.h"
 #include "RawInput.h"
@@ -62,7 +101,6 @@ enum MsgType {
     MSG_ERROR = 9,
     MSG_LAYER_ADD = 10,
     MSG_LAYER_DEL = 11,
-    MSG_LAYER_SELECT = 12,
     MSG_LAYER_SYNC = 13,   // Full layer data sync (for undo/redo)
     MSG_LAYER_REORDER = 14,
     MSG_SIGNATURE = 15,     // New signature message
@@ -304,7 +342,7 @@ pthread_t tcp_receiver_tid = 0;
  *****************************************************************************/
 
 int connect_tcp() {
-    printf("[Client][TCP] Connecting to %s:%d...\n", serverIp, TCP_PORT);
+    // printf("[Client][TCP] Connecting to %s:%d...\n", serverIp, TCP_PORT);
     
     tcpSock = socket(AF_INET, SOCK_STREAM, 0);
     if (tcpSock < 0) {
@@ -324,12 +362,12 @@ int connect_tcp() {
         return -1;
     }
 
-    printf("[Client][TCP] Connected successfully!\n");
+    // printf("[Client][TCP] Connected successfully!\n");
     return 0;
 }
 
 int setup_udp(int canvas_id) {
-    printf("[Client][UDP] Setting up socket for canvas #%d (port %d)...\n", canvas_id, UDP_BASE_PORT + canvas_id);
+    // printf("[Client][UDP] Setting up socket for canvas #%d (port %d)...\n", canvas_id, UDP_BASE_PORT + canvas_id);
     
     udpSock = socket(AF_INET, SOCK_DGRAM, 0);
     if (udpSock < 0) {
@@ -342,7 +380,7 @@ int setup_udp(int canvas_id) {
     serverUdpAddr.sin_port = htons(UDP_BASE_PORT + canvas_id);
     inet_pton(AF_INET, serverIp, &serverUdpAddr.sin_addr);
 
-    printf("[Client][UDP] Socket ready for canvas #%d\n", canvas_id);
+    // printf("[Client][UDP] Socket ready for canvas #%d\n", canvas_id);
     return 0;
 }
 
@@ -361,7 +399,7 @@ bool compress_signature(uint8_t* out_buffer) {
     
     // Use ABGR8888 so that the memory layout is [R, G, B, A] on Little Endian
     if (SDL_RenderReadPixels(renderer, NULL, SDL_PIXELFORMAT_ABGR8888, raw_pixels, SIGNATURE_WIDTH * 4) != 0) {
-        printf("[Client][Signature] Failed to read pixels: %s\n", SDL_GetError());
+        // printf("[Client][Signature] Failed to read pixels: %s\n", SDL_GetError());
         delete[] raw_pixels;
         SDL_SetRenderTarget(renderer, NULL);
         return false;
@@ -424,7 +462,7 @@ bool compress_signature(uint8_t* out_buffer) {
         }
     }
     
-    printf("[Client][Signature] Compressed signature: %d blocks active (2-bit grayscale)\n", setBits);
+    // printf("[Client][Signature] Compressed signature: %d blocks active (2-bit grayscale)\n", setBits);
     
     delete[] raw_pixels;
     SDL_SetRenderTarget(renderer, NULL);
@@ -447,7 +485,7 @@ void send_tcp_signature() {
         if (send(tcpSock, &msg, sizeof(msg), 0) < 0) {
             perror("[Client][TCP] Signature send failed");
         } else {
-            printf("[Client][TCP] Sent signature (256 bytes)\n");
+            // printf("[Client][TCP] Sent signature (256 bytes)\n");
         }
     }
 }
@@ -456,18 +494,18 @@ void send_tcp_signature() {
 void send_tcp_login(const char* username) {
     if (tcpSock < 0) {
         if (connect_tcp() < 0) {
-            printf("[Client][TCP] Failed to connect for login!\n");
+            // printf("[Client][TCP] Failed to connect for login!\n");
             return;
         }
         // Start TCP receiver thread after connecting
         if (tcp_receiver_tid == 0) {
-            printf("[Client][TCP] Starting receiver thread...\n");
+            // printf("[Client][TCP] Starting receiver thread...\n");
             pthread_create(&tcp_receiver_tid, NULL, tcp_receiver_thread, NULL);
             pthread_detach(tcp_receiver_tid);
         }
     }
 
-    printf("[Client][TCP] Sending login request: canvas=%d, user=%s\n", currentCanvasId, username);
+    // printf("[Client][TCP] Sending login request: canvas=%d, user=%s\n", currentCanvasId, username);
     
     TCPMessage msg;
     memset(&msg, 0, sizeof(msg));
@@ -481,7 +519,7 @@ void send_tcp_login(const char* username) {
         return;
     }
     
-    printf("[Client][TCP] Login request sent\n");
+    // printf("[Client][TCP] Login request sent\n");
     
     // Send signature immediately after login
     send_tcp_signature();
@@ -520,38 +558,38 @@ bool send_tcp(int type, int layer_id = 0, const char* extra_data = nullptr, size
 }
 
 void send_tcp_save() {
-    printf("[Client][TCP] Sending save request...\n");
+    // printf("[Client][TCP] Sending save request...\n");
     if (send_tcp(MSG_SAVE)) {
-        printf("[Client][TCP] Save request sent\n");
+        // printf("[Client][TCP] Save request sent\n");
     }
 }
 
 void send_tcp_add_layer(int layer_id) {
-    printf("[Client][TCP] Sending add layer request: layer=%d\n", layer_id);
+    // printf("[Client][TCP] Sending add layer request: layer=%d\n", layer_id);
     
     // FLAG: We asked for this, so we want to switch to it when it arrives
     pendingMyNewLayer = true; 
     
     if (send_tcp(MSG_LAYER_ADD, layer_id)) {
-        printf("[Client][TCP] Add layer request sent\n");
+        // printf("[Client][TCP] Add layer request sent\n");
     }
 }
 
 void send_tcp_delete_layer(int layer_id) {
-    printf("[Client][TCP] Sending delete layer request: layer=%d\n", layer_id);
+    // printf("[Client][TCP] Sending delete layer request: layer=%d\n", layer_id);
     if (send_tcp(MSG_LAYER_DEL, layer_id)) {
-        printf("[Client][TCP] Delete layer request sent\n");
+        // printf("[Client][TCP] Delete layer request sent\n");
     }
 }
 
 void send_tcp_layer_sync(int layer_id) {
     if (layer_id <= 0 || layer_id >= MAX_LAYERS || !layers[layer_id]) return;
     
-    printf("[Client][TCP] Sending layer sync: layer=%d\n", layer_id);
+    // printf("[Client][TCP] Sending layer sync: layer=%d\n", layer_id);
     
     size_t layer_size = CANVAS_WIDTH * CANVAS_HEIGHT * 4;
     if (send_tcp(MSG_LAYER_SYNC, layer_id, (const char*)layers[layer_id], layer_size)) {
-        printf("[Client][TCP] Layer sync sent (%zu bytes)\n", layer_size);
+        // printf("[Client][TCP] Layer sync sent (%zu bytes)\n", layer_size);
     }
 }
 
@@ -565,7 +603,7 @@ void send_all_layers_sync() {
 }
 
 void send_tcp_reorder_layer(int old_idx, int new_idx) {
-    printf("[Client][TCP] Sending reorder layer: %d -> %d\n", old_idx, new_idx);
+    // printf("[Client][TCP] Sending reorder layer: %d -> %d\n", old_idx, new_idx);
     
     if (tcpSock < 0) return;
     
@@ -581,7 +619,7 @@ void send_tcp_reorder_layer(int old_idx, int new_idx) {
     if (send(tcpSock, &msg, sizeof(msg), 0) < 0) {
         perror("[Client][TCP] Reorder send failed");
     } else {
-        printf("[Client][TCP] Reorder request sent\n");
+        // printf("[Client][TCP] Reorder request sent\n");
     }
 }
 
@@ -606,11 +644,11 @@ void send_udp_draw(int x, int y, int pressure, int angle) {
     if (udpSock < 0) return;
     if (x < 0 || x >= CANVAS_WIDTH || y < 0 || y >= CANVAS_HEIGHT) return;
     if (currentLayerId <= 0) {
-        printf("[Client][Draw] Cannot draw on layer 0 (paper)!\n");
+        // printf("[Client][Draw] Cannot draw on layer 0 (paper)!\n");
         return;
     }
     if (currentLayerId >= MAX_LAYERS || !layers[currentLayerId]) {
-        printf("[Client][Draw] Invalid layer %d!\n", currentLayerId);
+        // printf("[Client][Draw] Invalid layer %d!\n", currentLayerId);
         return;
     }
 
@@ -720,8 +758,43 @@ void send_udp_draw(int x, int y, int pressure, int angle) {
     }
 }
 
-void send_udp_cursor(int x, int y) {
+void send_udp_line(int x, int y, int ex, int ey, int pressure, int angle) {
     if (udpSock < 0) return;
+    if (currentLayerId <= 0) return;
+    if (currentLayerId >= MAX_LAYERS || !layers[currentLayerId]) return;
+
+    UDPMessage pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type = MSG_LINE;
+    pkt.brush_id = currentBrushId;
+    pkt.layer_id = currentLayerId;
+    pkt.x = x;
+    pkt.y = y;
+    pkt.ex = ex;
+    pkt.ey = ey;
+    pkt.r = userColor.r;
+    pkt.g = userColor.g;
+    pkt.b = userColor.b;
+    pkt.a = userColor.a;
+    pkt.size = (currentBrushId < (int)availableBrushes.size()) ? availableBrushes[currentBrushId]->size : 5;
+    pkt.pressure = pressure;
+    
+    sendto(udpSock, &pkt, sizeof(pkt), 0, (struct sockaddr*)&serverUdpAddr, sizeof(serverUdpAddr));
+}
+
+void send_udp_cursor(int x, int y) {
+    static int last_cursor_x = -9999;
+    static int last_cursor_y = -9999;
+
+    if (udpSock < 0) return;
+
+    // Optimization: Cursor Deduplication
+    // Don't send packet if position hasn't changed
+    if (x == last_cursor_x && y == last_cursor_y) {
+        return;
+    }
+    last_cursor_x = x;
+    last_cursor_y = y;
 
     UDPMessage pkt;
     memset(&pkt, 0, sizeof(pkt));
@@ -744,7 +817,7 @@ void send_udp_cursor(int x, int y) {
 
 void* tcp_receiver_thread(void* arg) {
     (void)arg;
-    printf("[Client][TCP-Thread] Started receiver thread\n");
+    // printf("[Client][TCP-Thread] Started receiver thread\n");
     
     TCPMessage msg;
     while (running) {
@@ -752,7 +825,7 @@ void* tcp_receiver_thread(void* arg) {
         ssize_t n = recv(tcpSock, &msg, sizeof(msg), 0);
         if (n <= 0) {
             if (running && loggedin) {
-                printf("[Client][TCP-Thread] Connection closed or error. Shutting down.\n");
+                // printf("[Client][TCP-Thread] Connection closed or error. Shutting down.\n");
                 running = 0; // Signal main loop to exit
                 
                 // Push a quit event to wake up the main loop if it's waiting
@@ -761,17 +834,17 @@ void* tcp_receiver_thread(void* arg) {
                 event.quit.timestamp = SDL_GetTicks();
                 SDL_PushEvent(&event);
             } else {
-                printf("[Client][TCP-Thread] Socket closed (Logout).\n");
+                // printf("[Client][TCP-Thread] Socket closed (Logout).\n");
             }
             break;
         }
 
-        printf("[Client][TCP-Thread] Received message: type=%d, canvas=%d, data_len=%d\n",
+        // printf("[Client][TCP-Thread] Received message: type=%d, canvas=%d, data_len=%d\n",
                msg.type, msg.canvas_id, msg.data_len);
 
         switch (msg.type) {
             case MSG_LOGOUT:
-                printf("[Client][TCP-Thread] LOGOUT received for UID=%d\n", msg.user_id);
+                // printf("[Client][TCP-Thread] LOGOUT received for UID=%d\n", msg.user_id);
                 pthread_mutex_lock(&remoteClientsMutex);
                 // Remove signature
                 if (remoteClients.count(msg.user_id)) {
@@ -788,9 +861,11 @@ void* tcp_receiver_thread(void* arg) {
                 break;
 
             case MSG_WELCOME:
-                printf("[Client][TCP-Thread] WELCOME received! Canvas #%d, layers=%d, UID=%d\n", 
+                // printf("[Client][TCP-Thread] WELCOME received! Canvas #%d, layers=%d, UID=%d\n", 
                        msg.canvas_id, msg.layer_count, msg.user_id);
                 
+                print_tutorial_controls(); // Show controls on first login
+
                 loggedin = 1;
                 myUserId = msg.user_id;
                 layerCount = msg.layer_count > 0 ? msg.layer_count : 2;
@@ -800,7 +875,7 @@ void* tcp_receiver_thread(void* arg) {
                 for (int l = 1; l < layerCount && l < MAX_LAYERS; l++) {
                     if (!layers[l]) {
                         init_layer(l, false);  // transparent
-                        printf("[Client][TCP-Thread] Created layer %d\n", l);
+                        // printf("[Client][TCP-Thread] Created layer %d\n", l);
                     }
                 }
                 
@@ -808,7 +883,7 @@ void* tcp_receiver_thread(void* arg) {
                 {
                     int recv_layer_count;
                     if (recv(tcpSock, &recv_layer_count, sizeof(int), MSG_WAITALL) == sizeof(int)) {
-                        printf("[Client][TCP-Thread] Receiving %d layers from server\n", recv_layer_count);
+                        // printf("[Client][TCP-Thread] Receiving %d layers from server\n", recv_layer_count);
                         
                         for (int l = 1; l < recv_layer_count; l++) {
                             if (!layers[l]) {
@@ -825,7 +900,7 @@ void* tcp_receiver_thread(void* arg) {
                                 received += r;
                             }
                             
-                            printf("[Client][TCP-Thread] Received layer %d: %zu bytes\n", l, received);
+                            // printf("[Client][TCP-Thread] Received layer %d: %zu bytes\n", l, received);
                             layerIsDirty[l] = true; // Force GPU upload
                             layerDirtyRects[l] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
                         }
@@ -834,7 +909,7 @@ void* tcp_receiver_thread(void* arg) {
                 
                 // Setup UDP for this canvas
                 if (setup_udp(currentCanvasId) < 0) {
-                    printf("[Client][TCP-Thread] UDP setup failed!\n");
+                    // printf("[Client][TCP-Thread] UDP setup failed!\n");
                 } else {
                     pthread_t udp_tid;
                     pthread_create(&udp_tid, NULL, udp_receiver_thread, NULL);
@@ -853,7 +928,7 @@ void* tcp_receiver_thread(void* arg) {
 
             // --- SIGNATURE IMPLEMENTATION START ---
             case MSG_SIGNATURE:
-                printf("[Client][TCP-Thread] Received signature for UID=%d\n", msg.user_id);
+                // printf("[Client][TCP-Thread] Received signature for UID=%d\n", msg.user_id);
                 pthread_mutex_lock(&sigMutex);
                 {
                     PendingSig ps;
@@ -904,15 +979,15 @@ void* tcp_receiver_thread(void* arg) {
             // --- SIGNATURE IMPLEMENTATION END ---
 
             case MSG_CANVAS_DATA:
-                printf("[Client][TCP-Thread] CANVAS_DATA received: %d bytes\n", msg.data_len);
+                // printf("[Client][TCP-Thread] CANVAS_DATA received: %d bytes\n", msg.data_len);
                 break;
 
             case MSG_LAYER_ADD:
-                printf("[Client][TCP-Thread] LAYER_ADD confirmed: new layer count=%d\n", msg.layer_count);
+                // printf("[Client][TCP-Thread] LAYER_ADD confirmed: new layer count=%d\n", msg.layer_count);
                 pthread_mutex_lock(&layerMutex);
                 
                 if (ignore_layer_add > 0) {
-                    printf("[Client][TCP-Thread] Ignoring LAYER_ADD (self-triggered via Undo/Redo)\n");
+                    // printf("[Client][TCP-Thread] Ignoring LAYER_ADD (self-triggered via Undo/Redo)\n");
                     ignore_layer_add--;
                     layerCount = msg.layer_count;
                 } else {
@@ -920,7 +995,7 @@ void* tcp_receiver_thread(void* arg) {
                     // Create the new layer locally
                     if (layerCount > 1 && layerCount <= MAX_LAYERS && !layers[layerCount - 1]) {
                         init_layer(layerCount - 1, false);
-                        printf("[Client][TCP-Thread] Created layer %d locally\n", layerCount - 1);
+                        // printf("[Client][TCP-Thread] Created layer %d locally\n", layerCount - 1);
                     }
                     
                     // --- NEW LOGIC START ---
@@ -935,7 +1010,7 @@ void* tcp_receiver_thread(void* arg) {
                         // Or if you always append to top:
                         // currentLayerId = layerCount - 1;
 
-                        printf("[Client][TCP-Thread] Auto-selecting my new layer: %d\n", currentLayerId);
+                        // printf("[Client][TCP-Thread] Auto-selecting my new layer: %d\n", currentLayerId);
                         pendingMyNewLayer = false; // Reset flag
                     }
                     // --- NEW LOGIC END ---
@@ -945,12 +1020,12 @@ void* tcp_receiver_thread(void* arg) {
                 break;
 
             case MSG_LAYER_DEL:
-                printf("[Client][TCP-Thread] LAYER_DEL confirmed: deleted layer %d, new count=%d\n", 
+                // printf("[Client][TCP-Thread] LAYER_DEL confirmed: deleted layer %d, new count=%d\n", 
                        msg.layer_id, msg.layer_count);
                 pthread_mutex_lock(&layerMutex);
                 
                 if (ignore_layer_del > 0) {
-                    printf("[Client][TCP-Thread] Ignoring LAYER_DEL (self-triggered via Undo/Redo)\n");
+                    // printf("[Client][TCP-Thread] Ignoring LAYER_DEL (self-triggered via Undo/Redo)\n");
                     ignore_layer_del--;
                     layerCount = msg.layer_count;
                 } else {
@@ -975,7 +1050,7 @@ void* tcp_receiver_thread(void* arg) {
                         layerOpacity[MAX_LAYERS - 1] = 255; // Reset opacity for new empty slot
                         layerTextures[MAX_LAYERS - 1] = nullptr;
                         layerIsDirty[MAX_LAYERS - 1] = false;
-                        printf("[Client][TCP-Thread] Shifted layers down after deleting layer %d\n", msg.layer_id);
+                        // printf("[Client][TCP-Thread] Shifted layers down after deleting layer %d\n", msg.layer_id);
                     }
                     layerCount = msg.layer_count;
                 }
@@ -987,7 +1062,7 @@ void* tcp_receiver_thread(void* arg) {
                 break;
 
             case MSG_LAYER_SYNC:
-                printf("[Client][TCP-Thread] LAYER_SYNC received: layer=%d\n", msg.layer_id);
+                // printf("[Client][TCP-Thread] LAYER_SYNC received: layer=%d\n", msg.layer_id);
                 {
                     int layer_idx = msg.layer_id;
                     if (layer_idx > 0 && layer_idx < MAX_LAYERS) {
@@ -1009,11 +1084,11 @@ void* tcp_receiver_thread(void* arg) {
                         }
                         
                         if (received == layer_size) {
-                            printf("[Client][TCP-Thread] Layer %d synced (%zu bytes)\n", layer_idx, received);
+                            // printf("[Client][TCP-Thread] Layer %d synced (%zu bytes)\n", layer_idx, received);
                             layerIsDirty[layer_idx] = true;
                             layerDirtyRects[layer_idx] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
                         } else {
-                            printf("[Client][TCP-Thread] Layer sync incomplete: %zu/%zu bytes\n", received, layer_size);
+                            // printf("[Client][TCP-Thread] Layer sync incomplete: %zu/%zu bytes\n", received, layer_size);
                         }
                         
                         pthread_mutex_unlock(&layerMutex);
@@ -1025,7 +1100,7 @@ void* tcp_receiver_thread(void* arg) {
                 {
                     int old_idx = (uint8_t)msg.data[0];
                     int new_idx = (uint8_t)msg.data[1];
-                    printf("[Client][TCP-Thread] LAYER_REORDER: %d -> %d\n", old_idx, new_idx);
+                    // printf("[Client][TCP-Thread] LAYER_REORDER: %d -> %d\n", old_idx, new_idx);
                     
                     pthread_mutex_lock(&layerMutex);
                     if (old_idx > 0 && old_idx < MAX_LAYERS && new_idx > 0 && new_idx < MAX_LAYERS && layers[old_idx]) {
@@ -1075,7 +1150,7 @@ void* tcp_receiver_thread(void* arg) {
                     struct MoveData { int dx; int dy; } payload;
                     memcpy(&payload, msg.data, sizeof(MoveData));
                     
-                    printf("[Client][TCP-Thread] LAYER_MOVE: layer=%d dx=%d dy=%d\n", msg.layer_id, payload.dx, payload.dy);
+                    // printf("[Client][TCP-Thread] LAYER_MOVE: layer=%d dx=%d dy=%d\n", msg.layer_id, payload.dx, payload.dy);
 
                     pthread_mutex_lock(&layerMutex);
                     // Apply the move
@@ -1085,22 +1160,22 @@ void* tcp_receiver_thread(void* arg) {
                 break;
 
             case MSG_ERROR:
-                printf("[Client][TCP-Thread] ERROR from server: %s\n", msg.data);
+                // printf("[Client][TCP-Thread] ERROR from server: %s\n", msg.data);
                 break;
 
             default:
-                printf("[Client][TCP-Thread] Unknown message type: %d\n", msg.type);
+                // printf("[Client][TCP-Thread] Unknown message type: %d\n", msg.type);
                 break;
         }
     }
 
-    printf("[Client][TCP-Thread] Exiting\n");
+    // printf("[Client][TCP-Thread] Exiting\n");
     return NULL;
 }
 
 void* udp_receiver_thread(void* arg) {
     (void)arg;
-    printf("[Client][UDP-Thread] Started receiver thread for canvas #%d\n", currentCanvasId);
+    // printf("[Client][UDP-Thread] Started receiver thread for canvas #%d\n", currentCanvasId);
 
     struct sockaddr_in fromAddr;
     socklen_t fromLen = sizeof(fromAddr);
@@ -1201,15 +1276,115 @@ void* udp_receiver_thread(void* arg) {
                     }
                     break;
 
+                case MSG_LINE:
+                    {
+                        int layer_idx = pkt->layer_id;
+                        if (layer_idx <= 0 || layer_idx >= MAX_LAYERS) layer_idx = 1;
+                        if (!layers[layer_idx]) init_layer(layer_idx, false);
+
+                        if (pkt->brush_id < (int)availableBrushes.size()) {
+                            SDL_Color col = {pkt->r, pkt->g, pkt->b, pkt->a};
+                            int brushSize = pkt->size > 0 ? pkt->size : 5;
+                            bool isEraser = (pkt->brush_id == BRUSH_ERASER_ID);
+                            bool isSoftEraser = (pkt->brush_id == BRUSH_SOFT_ERASER_ID);
+                            int angle = (int)(atan2(pkt->ey - pkt->y, pkt->ex - pkt->x) * 180.0 / M_PI);
+
+                            // Bresenham / Interpolation Loop
+                            int x0 = pkt->x, y0 = pkt->y;
+                            int x1 = pkt->ex, y1 = pkt->ey;
+                            int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+                            int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+                            int err = dx + dy, e2;
+
+                            auto setPixel = [layer_idx, isEraser, isSoftEraser](int px, int py, SDL_Color c) {
+                                if (px >= 0 && px < CANVAS_WIDTH && py >= 0 && py < CANVAS_HEIGHT) {
+                                    int idx = (py * CANVAS_WIDTH + px) * 4;
+                                    if (isEraser) {
+                                        layers[layer_idx][idx] = layers[layer_idx][idx+1] = layers[layer_idx][idx+2] = layers[layer_idx][idx+3] = 0;
+                                        return;
+                                    }
+                                    if (isSoftEraser) {
+                                        uint8_t currentAlpha = layers[layer_idx][idx + 3];
+                                        uint8_t eraseStrength = c.a;
+                                        if (currentAlpha > 0) {
+                                            int newAlpha = (int)currentAlpha - (int)eraseStrength;
+                                            if (newAlpha < 0) newAlpha = 0;
+                                            layers[layer_idx][idx + 3] = (uint8_t)newAlpha;
+                                        }
+                                        return;
+                                    }
+                                    // Blending
+                                    uint8_t oldR = layers[layer_idx][idx];
+                                    uint8_t oldG = layers[layer_idx][idx + 1];
+                                    uint8_t oldB = layers[layer_idx][idx + 2];
+                                    uint8_t oldA = layers[layer_idx][idx + 3];
+                                    
+                                    if (c.a == 255) {
+                                        layers[layer_idx][idx] = c.r; layers[layer_idx][idx+1] = c.g; layers[layer_idx][idx+2] = c.b; layers[layer_idx][idx+3] = c.a;
+                                    } else {
+                                        float srcA = c.a / 255.0f;
+                                        float dstA = oldA / 255.0f;
+                                        float outA = srcA + dstA * (1.0f - srcA);
+                                        if (outA > 0.0f) {
+                                            float outR = (c.r * srcA + oldR * dstA * (1.0f - srcA)) / outA;
+                                            float outG = (c.g * srcA + oldG * dstA * (1.0f - srcA)) / outA;
+                                            float outB = (c.b * srcA + oldB * dstA * (1.0f - srcA)) / outA;
+                                            layers[layer_idx][idx] = (uint8_t)outR;
+                                            layers[layer_idx][idx+1] = (uint8_t)outG;
+                                            layers[layer_idx][idx+2] = (uint8_t)outB;
+                                            layers[layer_idx][idx+3] = (uint8_t)(outA * 255.0f);
+                                        }
+                                    }
+                                }
+                            };
+
+                            while (true) {
+                                availableBrushes[pkt->brush_id]->paint(x0, y0, col, brushSize, pkt->pressure, angle, setPixel);
+                                if (x0 == x1 && y0 == y1) break;
+                                e2 = 2 * err;
+                                if (e2 >= dy) { err += dy; x0 += sx; }
+                                if (e2 <= dx) { err += dx; y0 += sy; }
+                            }
+
+                            pthread_mutex_lock(&layerMutex);
+                            // Mark the bounding box of the line as dirty
+                            int minX = min(pkt->x, pkt->ex) - brushSize;
+                            int minY = min(pkt->y, pkt->ey) - brushSize;
+                            int w = abs(pkt->ex - pkt->x) + brushSize * 2;
+                            int h = abs(pkt->ey - pkt->y) + brushSize * 2;
+                            // We can just mark the whole rect
+                            // Or iterate. For simplicity, let's mark the start and end, 
+                            // but ideally we should mark the whole area.
+                            // The existing mark_layer_dirty handles a rect around a point.
+                            // Let's just mark the bounding box.
+                            // But mark_layer_dirty implementation might expect a point and size.
+                            // Let's check mark_layer_dirty.
+                            // It seems to take x, y, size.
+                            // We'll just mark the start and end for now, or maybe the middle?
+                            // Actually, since we modified pixels directly, we need to ensure the GPU updates.
+                            // Let's mark the whole bounding box by calling it on the center with a large size?
+                            // No, that's hacky.
+                            // Let's just mark the start and end points with a size covering the distance?
+                            // No.
+                            // Let's just mark the start and end. The dirty rect logic in client might merge them?
+                            mark_layer_dirty(layer_idx, pkt->x, pkt->y, brushSize);
+                            mark_layer_dirty(layer_idx, pkt->ex, pkt->ey, brushSize);
+                            // And the middle point to be safe
+                            mark_layer_dirty(layer_idx, (pkt->x + pkt->ex)/2, (pkt->y + pkt->ey)/2, brushSize);
+                            pthread_mutex_unlock(&layerMutex);
+                        }
+                    }
+                    break;
+
                 case MSG_CURSOR:
                     // Remote cursor
                     {
                         // Update remote cursor position
                         // Use brush_id as user_id
                         int uid = pkt->brush_id;
-                        // printf("UDP Cursor Update: UID=%d  X=%d Y=%d\n", uid, pkt->x, pkt->y);
+                        // // printf("UDP Cursor Update: UID=%d  X=%d Y=%d\n", uid, pkt->x, pkt->y);
                         if (uid != myUserId) { // Don't track ourselves
-                            // printf("[Client][UDP] Updating cursor for UID %d (My ID: %d)\n", uid, myUserId);
+                            // // printf("[Client][UDP] Updating cursor for UID %d (My ID: %d)\n", uid, myUserId);
                             pthread_mutex_lock(&remoteClientsMutex);
                             remoteClients[uid].x = pkt->x;
                             remoteClients[uid].y = pkt->y;
@@ -1234,7 +1409,7 @@ void* udp_receiver_thread(void* arg) {
         }
     }
 
-    printf("[Client][UDP-Thread] Exiting\n");
+    // printf("[Client][UDP-Thread] Exiting\n");
     return NULL;
 }
 
@@ -1278,14 +1453,14 @@ void record_delete_layer_command(int layer_id) {
 
 void perform_undo() {
     if (undoStack.empty()) {
-        printf("[Client] Nothing to undo.\n");
+        // printf("[Client] Nothing to undo.\n");
         return;
     }
 
     // Check Timeout
     uint32_t now = SDL_GetTicks();
     if (now - lastActionTime > UNDO_TIMEOUT_MS) {
-        printf("[Client] Undo expired! (Time limit exceeded)\n");
+        // printf("[Client] Undo expired! (Time limit exceeded)\n");
         // Optional: Clear stack to prevent confusion?
         // clear_undo_stack(); 
         return;
@@ -1308,13 +1483,13 @@ void perform_undo() {
         layerDirtyRects[i] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
     }
     
-    printf("[Client] Undid action.\n");
+    // printf("[Client] Undid action.\n");
     lastActionTime = now; // Reset timer on action
 }
 
 void perform_redo() {
     if (redoStack.empty()) {
-        printf("[Client] Nothing to redo.\n");
+        // printf("[Client] Nothing to redo.\n");
         return;
     }
 
@@ -1334,7 +1509,7 @@ void perform_redo() {
         layerDirtyRects[i] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
     }
 
-    printf("[Client] Redid action.\n");
+    // printf("[Client] Redid action.\n");
 }
 
 // --- MENU UI GLOBALS ---
@@ -1422,9 +1597,9 @@ vector<uint8_t> packbits_decompress(const vector<uint8_t>& in) {
 }
 
 void load_menu_ui() {
-    printf("[Client][UI] Loading ui.json...\n");
+    // printf("[Client][UI] Loading ui.json...\n");
     FILE* f = fopen("ui.json", "r");
-    if (!f) { printf("[Client][UI] ui.json not found!\n"); return; }
+    if (!f) { // printf("[Client][UI] ui.json not found!\n"); return; }
     
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
@@ -1476,7 +1651,7 @@ void load_menu_ui() {
         menuLayers.push_back(layer);
         pos = end;
     }
-    printf("[Client][UI] Loaded %zu layers for menu background\n", menuLayers.size());
+    // printf("[Client][UI] Loaded %zu layers for menu background\n", menuLayers.size());
 }
 
 void update_menu_texture() {
@@ -1532,7 +1707,7 @@ void update_menu_texture() {
 }
 
 void init_canvas() {
-    printf("[Client][Canvas] Initializing layer system (%dx%d)...\n", CANVAS_WIDTH, CANVAS_HEIGHT);
+    // printf("[Client][Canvas] Initializing layer system (%dx%d)...\n", CANVAS_WIDTH, CANVAS_HEIGHT);
     
     // Initialize composite buffer
     if (compositeCanvas) delete[] compositeCanvas;
@@ -1540,11 +1715,11 @@ void init_canvas() {
     
     // Initialize layer 0 (white paper)
     init_layer(0, true);
-    printf("[Client][Canvas] Layer 0 (paper) initialized to white\n");
+    // printf("[Client][Canvas] Layer 0 (paper) initialized to white\n");
     
     // Initialize layer 1 (first drawable, transparent)
     init_layer(1, false);
-    printf("[Client][Canvas] Layer 1 initialized as transparent\n");
+    // printf("[Client][Canvas] Layer 1 initialized as transparent\n");
     
     // Initialize display IDs and Opacity
     for (int i = 0; i < MAX_LAYERS; i++) {
@@ -1552,7 +1727,7 @@ void init_canvas() {
         layerOpacity[i] = 255;
     }
     
-    printf("[Client][Canvas] Canvas initialized with %d layers\n", layerCount);
+    // printf("[Client][Canvas] Canvas initialized with %d layers\n", layerCount);
 }
 
 void clear_signature(SDL_Renderer* renderer) {
@@ -1580,7 +1755,7 @@ void update_canvas_texture() {
                 SDL_SetTextureBlendMode(layerTextures[i], SDL_BLENDMODE_BLEND);
                 layerIsDirty[i] = true; // Force immediate upload
                 layerDirtyRects[i] = {0, 0, CANVAS_WIDTH, CANVAS_HEIGHT};
-                printf("[Client][Main] Created GPU Texture for Layer %d\n", i);
+                // printf("[Client][Main] Created GPU Texture for Layer %d\n", i);
             }
         }
         
@@ -1588,14 +1763,14 @@ void update_canvas_texture() {
         if (!layers[i] && layerTextures[i]) {
             SDL_DestroyTexture(layerTextures[i]);
             layerTextures[i] = nullptr;
-            printf("[Client][Main] Destroyed GPU Texture for Layer %d\n", i);
+            // printf("[Client][Main] Destroyed GPU Texture for Layer %d\n", i);
         }
     }
 }
 
 void download_as_bmp() {
     // Save the flattened canvas as a BMP file locally
-    printf("[Client][Download] Saving canvas as BMP...\n");
+    // printf("[Client][Download] Saving canvas as BMP...\n");
     
     if (!compositeCanvas) {
         // Allocate if missing
@@ -1642,7 +1817,7 @@ void download_as_bmp() {
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
     char filename[128];
-    snprintf(filename, sizeof(filename), "canvas_%04d%02d%02d_%02d%02d%02d.bmp",
+    sn// printf(filename, sizeof(filename), "canvas_%04d%02d%02d_%02d%02d%02d.bmp",
              t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
              t->tm_hour, t->tm_min, t->tm_sec);
     
@@ -1656,15 +1831,15 @@ void download_as_bmp() {
     );
     
     if (!surface) {
-        printf("[Client][Download] ERROR: Failed to create surface: %s\n", SDL_GetError());
+        // printf("[Client][Download] ERROR: Failed to create surface: %s\n", SDL_GetError());
         return;
     }
     
     // Save as BMP
     if (SDL_SaveBMP(surface, filename) == 0) {
-        printf("[Client][Download] Saved canvas to: %s\n", filename);
+        // printf("[Client][Download] Saved canvas to: %s\n", filename);
     } else {
-        printf("[Client][Download] ERROR: Failed to save BMP: %s\n", SDL_GetError());
+        // printf("[Client][Download] ERROR: Failed to save BMP: %s\n", SDL_GetError());
     }
     
     SDL_FreeSurface(surface);
@@ -1675,7 +1850,7 @@ void download_as_bmp() {
  *****************************************************************************/
 
 void init_brushes() {
-    printf("[Client][Brushes] Initializing brush system...\n");
+    // printf("[Client][Brushes] Initializing brush system...\n");
     
     // Order must match constants:
     // 0: Round
@@ -1698,7 +1873,7 @@ void init_brushes() {
         availableBrushes[i]->size = 15;
     }
     
-    printf("[Client][Brushes] %zu brushes loaded\n", availableBrushes.size());
+    // printf("[Client][Brushes] %zu brushes loaded\n", availableBrushes.size());
 }
 
 SDL_Color get_composite_pixel(int x, int y) {
@@ -1784,20 +1959,20 @@ void handle_events() {
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
             case SDL_QUIT:
-                printf("[Client][Event] QUIT received\n");
+                // printf("[Client][Event] QUIT received\n");
                 running = 0;
                 break;
 
             case SDL_MOUSEBUTTONDOWN:
                 // Ignore mouse events simulated from touch to avoid double-drawing
                 if (e.button.which == SDL_TOUCH_MOUSEID) {
-                    // printf("[Client][Input] Ignoring simulated mouse down\n");
+                    // // printf("[Client][Input] Ignoring simulated mouse down\n");
                     break;
                 }
 
                 if (e.button.button == SDL_BUTTON_LEFT) {
                     // Debug Mouse Event
-                    printf("[Client][Input] Mouse Down (Real Mouse) ID=%d\n", e.button.which);
+                    // printf("[Client][Input] Mouse Down (Real Mouse) ID=%d\n", e.button.which);
 
                     int mx = e.button.x;
                     int my = e.button.y;
@@ -1824,7 +1999,7 @@ void handle_events() {
                                 isPanning = true;
                                 lastMouseX = mx;
                                 lastMouseY = my;
-                                printf("[Client] Started Panning\n");
+                                // printf("[Client] Started Panning\n");
                             }
                             // CHECK CTRL KEY STATE FOR LAYER MOVE
                             else {
@@ -1837,7 +2012,7 @@ void handle_events() {
                                         totalMoveY = 0;
                                         lastMouseX = mx;
                                         lastMouseY = my;
-                                        printf("[Client] Started Layer Move\n");
+                                        // printf("[Client] Started Layer Move\n");
                                     }
                                 }
                                 // If eyedropper is active, pick color
@@ -1848,7 +2023,7 @@ void handle_events() {
                                     if (cx >= 0 && cx < CANVAS_WIDTH && cy >= 0 && cy < CANVAS_HEIGHT) {
                                         userColor = get_composite_pixel(cx, cy);
                                         isEyedropping = false; // Turn off after picking
-                                        printf("[Client][Tool] Picked color: %d,%d,%d\n", userColor.r, userColor.g, userColor.b);
+                                        // printf("[Client][Tool] Picked color: %d,%d,%d\n", userColor.r, userColor.g, userColor.b);
                                     }
                                 } else {
                                     // Drawing on canvas - save undo state before starting stroke
@@ -1887,7 +2062,7 @@ void handle_events() {
                         int my = e.button.y;
                         if (mx >= 0 && mx < CANVAS_WIDTH && my >= 0 && my < CANVAS_HEIGHT) {
                             userColor = get_composite_pixel(mx, my);
-                            printf("[Client][Tool] Right-click picked color: %d,%d,%d\n", userColor.r, userColor.g, userColor.b);
+                            // printf("[Client][Tool] Right-click picked color: %d,%d,%d\n", userColor.r, userColor.g, userColor.b);
                         }
                     }
                 }
@@ -1906,11 +2081,11 @@ void handle_events() {
                 if (e.button.button == SDL_BUTTON_LEFT) {
                     if (isPanning) {
                         isPanning = false;
-                        printf("[Client] Stopped Panning\n");
+                        // printf("[Client] Stopped Panning\n");
                     }
                     else if (isMovingLayer) {
                         // Finish Move: Send Command to Server
-                        printf("[Client] Finished Move. Total Delta: (%d, %d)\n", totalMoveX, totalMoveY);
+                        // printf("[Client] Finished Move. Total Delta: (%d, %d)\n", totalMoveX, totalMoveY);
                         
                         if (totalMoveX != 0 || totalMoveY != 0) {
                             send_tcp_layer_move(currentLayerId, totalMoveX, totalMoveY);
@@ -1967,7 +2142,7 @@ void handle_events() {
                     int pressureInt = (int)(pressure * 255);
                     
                     // Debug pressure
-                    printf("[Client][Input] Finger Event: Type=%s, X=%d, Y=%d, Pressure=%.2f, DeviceID=%ld\n", 
+                    // printf("[Client][Input] Finger Event: Type=%s, X=%d, Y=%d, Pressure=%.2f, DeviceID=%ld\n", 
                         (e.type == SDL_FINGERDOWN) ? "DOWN" : "MOTION", mx, my, pressure, (long)e.tfinger.touchId);
                     
                     // If finger down, start stroke
@@ -2150,12 +2325,8 @@ void handle_events() {
                     }
                     
                     if (loggedin && myUserId > 0) { // Only send if we know who we are
-                        if (mx != lastSentX || my != lastSentY) {
-                            // Send Canvas Coords
-                            send_udp_cursor(mx - viewOffsetX, my - viewOffsetY);
-                            lastSentX = mx;
-                            lastSentY = my;
-                        }
+                        // Send Canvas Coords (Deduplication handled inside function)
+                        send_udp_cursor(mx - viewOffsetX, my - viewOffsetY);
                     }
                     
                     if (mouseDown && !isPanning) {
@@ -2166,7 +2337,7 @@ void handle_events() {
                             float p = RawInput_GetPressure();
                             if (p >= 0.0f) {
                                 pressure = (int)(p * 255);
-                                // printf("[Client][Input] Raw Pressure: %.2f -> %d\n", p, pressure);
+                                // // printf("[Client][Input] Raw Pressure: %.2f -> %d\n", p, pressure);
                             }
                         }
                         
@@ -2197,20 +2368,25 @@ void handle_events() {
                             // Use the stabilized angle
                             int angle = lastStableAngle;
                             
-                            // Interpolate between last position and current
+                            // Send LINE packet to server (Optimization: One packet instead of many)
+                            send_udp_line(lastMouseX - viewOffsetX, lastMouseY - viewOffsetY, 
+                                          mx - viewOffsetX, my - viewOffsetY, pressure, angle);
+
+                            // Interpolate LOCALLY for immediate feedback
                             int steps = max(abs(dx), abs(dy));
                             if (steps > 0) {
                                 for (int i = 1; i <= steps; i++) {
                                     int ix = lastMouseX + (dx * i) / steps;
                                     int iy = lastMouseY + (dy * i) / steps;
-                                    // Transform to Canvas Coords
-                                    send_udp_draw(ix - viewOffsetX, iy - viewOffsetY, pressure, angle);
+                                    // Draw locally only (don't send network)
+                                    draw_brush(ix - viewOffsetX, iy - viewOffsetY, userColor, 
+                                               (currentBrushId < (int)availableBrushes.size()) ? availableBrushes[currentBrushId]->size : 5, 
+                                               pressure, angle);
                                 }
                             }
-                            // Also draw at current position
+                            
                             lastMouseX = mx;
                             lastMouseY = my;
-                            send_udp_draw(mx - viewOffsetX, my - viewOffsetY, pressure, angle);
                         } else {
                             lastMouseX = mx;
                             lastMouseY = my;
@@ -2222,12 +2398,12 @@ void handle_events() {
 
             case SDL_CONTROLLERAXISMOTION:
                 // Debugging: Check if tablet pressure is being sent as a joystick axis
-                // printf("[Client][Input] Axis Motion: Axis %d Value %d\n", e.caxis.axis, e.caxis.value);
+                // // printf("[Client][Input] Axis Motion: Axis %d Value %d\n", e.caxis.axis, e.caxis.value);
                 break;
 
             case SDL_JOYAXISMOTION:
                 // Debugging: Check if tablet pressure is being sent as a joystick axis
-                // printf("[Client][Input] Joystick Axis: Axis %d Value %d\n", e.jaxis.axis, e.jaxis.value);
+                // // printf("[Client][Input] Joystick Axis: Axis %d Value %d\n", e.jaxis.axis, e.jaxis.value);
                 break;
 
             case SDL_KEYDOWN:
@@ -2240,27 +2416,27 @@ void handle_events() {
                         int digit = e.key.keysym.sym - SDLK_0;
                         // Shift left and add new digit, mod 100
                         currentCanvasId = (currentCanvasId * 10 + digit) % 100;
-                        printf("[Client][Lobby] Canvas selection: %02d\n", currentCanvasId);
+                        // printf("[Client][Lobby] Canvas selection: %02d\n", currentCanvasId);
                     }
                 }
 
                 if (loggedin) {
                     if (e.key.keysym.sym == SDLK_TAB) {
                         uiVisible = !uiVisible;
-                        printf("[Client] UI Visibility: %s\n", uiVisible ? "ON" : "OFF");
+                        // printf("[Client] UI Visibility: %s\n", uiVisible ? "ON" : "OFF");
                     }
                     else if (e.key.keysym.sym == SDLK_q) {
                         if (currentBrushId >= 0 && currentBrushId < (int)availableBrushes.size()) {
                             if (availableBrushes[currentBrushId]->size > 1) {
                                 availableBrushes[currentBrushId]->size--;
-                                printf("[Client][UI] Brush size decreased to %d\n", availableBrushes[currentBrushId]->size);
+                                // printf("[Client][UI] Brush size decreased to %d\n", availableBrushes[currentBrushId]->size);
                             }
                         }
                     } else if (e.key.keysym.sym == SDLK_w) {
                         if (currentBrushId >= 0 && currentBrushId < (int)availableBrushes.size()) {
                             if (availableBrushes[currentBrushId]->size < 150) {
                                 availableBrushes[currentBrushId]->size++;
-                                printf("[Client][UI] Brush size increased to %d\n", availableBrushes[currentBrushId]->size);
+                                // printf("[Client][UI] Brush size increased to %d\n", availableBrushes[currentBrushId]->size);
                             }
                         }
                     }
@@ -2268,7 +2444,7 @@ void handle_events() {
                 switch (e.key.keysym.sym) {
                     case SDLK_ESCAPE:
                         if (loggedin) {
-                            printf("[Client] Logging out...\n");
+                            // printf("[Client] Logging out...\n");
                             
                             // --- FIX: FORCE CURSOR VISIBLE ---
                             SDL_ShowCursor(SDL_ENABLE);
@@ -2318,7 +2494,7 @@ void handle_events() {
                             windowHeight = MENU_HEIGHT;
                             SetupUI();
                             
-                            printf("[Client] Logged out successfully.\n");
+                            // printf("[Client] Logged out successfully.\n");
                         } else {
                             // If in menu, Quit Application
                             running = 0;
@@ -2333,7 +2509,7 @@ void handle_events() {
                                 int op = availableBrushes[currentBrushId]->opacity;
                                 op = min(255, op + 10);
                                 availableBrushes[currentBrushId]->opacity = op;
-                                printf("[Client][Brush] Opacity increased to %d\n", op);
+                                // printf("[Client][Brush] Opacity increased to %d\n", op);
                             }
                         }
                         break;
@@ -2343,7 +2519,7 @@ void handle_events() {
                             int op = availableBrushes[currentBrushId]->opacity;
                             op = max(0, op - 10);
                             availableBrushes[currentBrushId]->opacity = op;
-                            printf("[Client][Brush] Opacity decreased to %d\n", op);
+                            // printf("[Client][Brush] Opacity decreased to %d\n", op);
                         }
                         break;
                     case SDLK_z:
@@ -2387,13 +2563,13 @@ void handle_events() {
                     case SDLK_LEFT:
                         if (currentLayerId > 0 && currentLayerId < MAX_LAYERS) {
                             layerOpacity[currentLayerId] = max(0, layerOpacity[currentLayerId] - 25);
-                            printf("[Client][Layer] Layer %d opacity: %d\n", currentLayerId, layerOpacity[currentLayerId]);
+                            // printf("[Client][Layer] Layer %d opacity: %d\n", currentLayerId, layerOpacity[currentLayerId]);
                         }
                         break;
                     case SDLK_RIGHT:
                         if (currentLayerId > 0 && currentLayerId < MAX_LAYERS) {
                             layerOpacity[currentLayerId] = min(255, layerOpacity[currentLayerId] + 25);
-                            printf("[Client][Layer] Layer %d opacity: %d\n", currentLayerId, layerOpacity[currentLayerId]);
+                            // printf("[Client][Layer] Layer %d opacity: %d\n", currentLayerId, layerOpacity[currentLayerId]);
                         }
                         break;
                     default:
@@ -2453,37 +2629,39 @@ int main(int argc, char* argv[]) {
     // Prevent crash when writing to closed socket
     signal(SIGPIPE, SIG_IGN);
 
-    printf("[Client][Main] ==============================================\n");
-    printf("[Client][Main] Shared Canvas Client Starting\n");
-    printf("[Client][Main] ==============================================\n");
+    // printf("[Client][Main] ==============================================\n");
+    // printf("[Client][Main] Shared Canvas Client Starting\n");
+    // printf("[Client][Main] ==============================================\n");
     
+    print_tutorial_intro(); // Show intro tutorial
+
     // Parse command line
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--nuclear") == 0) {
             use_raw_input = true;
-            printf("[Client][Main] NUCLEAR OPTION ENABLED: Using raw input for pressure\n");
+            // printf("[Client][Main] NUCLEAR OPTION ENABLED: Using raw input for pressure\n");
         } else if (argv[i][0] != '-') {
             strncpy(serverIp, argv[i], sizeof(serverIp) - 1);
         }
     }
-    printf("[Client][Main] Server IP: %s\n", serverIp);
+    // printf("[Client][Main] Server IP: %s\n", serverIp);
 
     // Initialize Raw Input if requested
     if (use_raw_input) {
         if (!RawInput_Start()) {
-            printf("[Client][Main] Failed to start Nuclear Input. Falling back to SDL.\n");
+            // printf("[Client][Main] Failed to start Nuclear Input. Falling back to SDL.\n");
             use_raw_input = false;
         }
     }
 
     // Initialize SDL
-    printf("[Client][Main] Initializing SDL...\n");
+    // printf("[Client][Main] Initializing SDL...\n");
     // Hint to separate mouse and touch events (helps with Wacom pressure)
     SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
     SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
     
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        printf("[Client][Main] SDL_Init failed: %s\n", SDL_GetError());
+        // printf("[Client][Main] SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
 
@@ -2492,14 +2670,14 @@ int main(int argc, char* argv[]) {
                               MENU_WIDTH, MENU_HEIGHT,
                               SDL_WINDOW_SHOWN);
     if (!window) {
-        printf("[Client][Main] SDL_CreateWindow failed: %s\n", SDL_GetError());
+        // printf("[Client][Main] SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_Quit();
         return 1;
     }
 
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     if (!renderer) {
-        printf("[Client][Main] SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        // printf("[Client][Main] SDL_CreateRenderer failed: %s\n", SDL_GetError());
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 1;
@@ -2509,7 +2687,7 @@ int main(int argc, char* argv[]) {
                                       SDL_TEXTUREACCESS_STREAMING,
                                       CANVAS_WIDTH, CANVAS_HEIGHT);
     if (!canvasTexture) {
-        printf("[Client][Main] SDL_CreateTexture failed: %s\n", SDL_GetError());
+        // printf("[Client][Main] SDL_CreateTexture failed: %s\n", SDL_GetError());
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
         SDL_Quit();
@@ -2521,7 +2699,7 @@ int main(int argc, char* argv[]) {
                                          SDL_TEXTUREACCESS_TARGET,
                                          SIGNATURE_WIDTH, SIGNATURE_HEIGHT);
     if (!signatureTexture) {
-        printf("[Client][Main] Failed to create signature texture: %s\n", SDL_GetError());
+        // printf("[Client][Main] Failed to create signature texture: %s\n", SDL_GetError());
     } else {
         // Clear it to transparent
         SDL_SetTextureBlendMode(signatureTexture, SDL_BLENDMODE_BLEND);
@@ -2531,25 +2709,25 @@ int main(int argc, char* argv[]) {
         SDL_SetRenderTarget(renderer, NULL);
     }
 
-    printf("[Client][Main] SDL initialized successfully\n");
+    // printf("[Client][Main] SDL initialized successfully\n");
     
     SDL_version compiled;
     SDL_version linked;
     SDL_VERSION(&compiled);
     SDL_GetVersion(&linked);
-    printf("[Client][Debug] SDL Compiled Version: %d.%d.%d\n", compiled.major, compiled.minor, compiled.patch);
-    printf("[Client][Debug] SDL Linked Version: %d.%d.%d\n", linked.major, linked.minor, linked.patch);
+    // printf("[Client][Debug] SDL Compiled Version: %d.%d.%d\n", compiled.major, compiled.minor, compiled.patch);
+    // printf("[Client][Debug] SDL Linked Version: %d.%d.%d\n", linked.major, linked.minor, linked.patch);
 
     // Debug: Print Video Driver
     const char* videoDriver = SDL_GetCurrentVideoDriver();
-    printf("[Client][Debug] Current Video Driver: %s\n", videoDriver ? videoDriver : "Unknown");
+    // printf("[Client][Debug] Current Video Driver: %s\n", videoDriver ? videoDriver : "Unknown");
     
     // Debug: Print Touch Devices
     int numTouchDevices = SDL_GetNumTouchDevices();
-    printf("[Client][Debug] Number of Touch Devices: %d\n", numTouchDevices);
+    // printf("[Client][Debug] Number of Touch Devices: %d\n", numTouchDevices);
     for (int i = 0; i < numTouchDevices; i++) {
         SDL_TouchID touchId = SDL_GetTouchDevice(i);
-        printf("[Client][Debug] Touch Device %d ID: %ld\n", i, (long)touchId);
+        // printf("[Client][Debug] Touch Device %d ID: %ld\n", i, (long)touchId);
     }
 
     // Initialize systems
@@ -2581,13 +2759,13 @@ int main(int argc, char* argv[]) {
 
     SetupUI();
 
-    printf("[Client][Main] Starting main loop...\n");
-    printf("[Client][Main] Use arrow keys in lobby to select canvas (0-9)\n");
-    printf("[Client][Main] Click Login button to join a canvas\n");
-    printf("[Client][Main] Press [ or ] to switch layers\n");
-    printf("[Client][Main] Press 1-3 to switch brushes\n");
-    printf("[Client][Main] Press Ctrl+S to save\n");
-    printf("[Client][Main] Press ESC to quit\n");
+    // printf("[Client][Main] Starting main loop...\n");
+    // printf("[Client][Main] Use arrow keys in lobby to select canvas (0-9)\n");
+    // printf("[Client][Main] Click Login button to join a canvas\n");
+    // printf("[Client][Main] Press [ or ] to switch layers\n");
+    // printf("[Client][Main] Press 1-3 to switch brushes\n");
+    // printf("[Client][Main] Press Ctrl+S to save\n");
+    // printf("[Client][Main] Press ESC to quit\n");
     
     // Main loop
     while (running) {
@@ -2634,7 +2812,7 @@ int main(int argc, char* argv[]) {
             pthread_mutex_unlock(&sigMutex);
             
             for (const auto& ps : toProcess) {
-                printf("[Client][Main] Processing pending signature for UID=%d...\n", ps.user_id);
+                // printf("[Client][Main] Processing pending signature for UID=%d...\n", ps.user_id);
                 // Reconstruct 45x15 surface (from 10x10 blocks)
                 SDL_Surface* surf = SDL_CreateRGBSurfaceWithFormat(0, 45, 15, 32, SDL_PIXELFORMAT_RGBA8888);
                 if (surf) {
@@ -2677,7 +2855,7 @@ int main(int argc, char* argv[]) {
                     pthread_mutex_unlock(&remoteClientsMutex);
                     
                     SDL_FreeSurface(surf);
-                    printf("[Client][Main] Stored signature for UID=%d\n", ps.user_id);
+                    // printf("[Client][Main] Stored signature for UID=%d\n", ps.user_id);
                 }
             }
         }
@@ -2694,7 +2872,7 @@ int main(int argc, char* argv[]) {
             pthread_mutex_lock(&remoteClientsMutex);
             for (auto& [uid, client] : remoteClients) {
                 if (uid == myUserId) continue; // Hide own signature
-                // if (client.hasSignature) printf("[Client][Render] UID=%d hasSig=%d tex=%p pos=(%d,%d)\n", uid, client.hasSignature, client.sigTexture, client.x, client.y);
+                // if (client.hasSignature) // printf("[Client][Render] UID=%d hasSig=%d tex=%p pos=(%d,%d)\n", uid, client.hasSignature, client.sigTexture, client.x, client.y);
                 if (client.hasSignature && client.sigTexture) {
                     // 1. Apply the user's color to the signature texture
                     SDL_SetTextureColorMod(client.sigTexture, client.r, client.g, client.b);
@@ -2731,7 +2909,7 @@ int main(int argc, char* argv[]) {
         SDL_Delay(16); // ~60 FPS
     }
 
-    printf("[Client][Main] Shutting down...\n");
+    // printf("[Client][Main] Shutting down...\n");
 
     if (use_raw_input) {
         RawInput_Stop();

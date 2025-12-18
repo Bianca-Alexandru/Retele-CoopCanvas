@@ -3,6 +3,7 @@ title Co-op Canvas Architecture
 # Define Participants
 participantgroup #lightgrey **Client Side**
     actor User
+    participant "Raw Input Thread\n(Nuclear Option)" as RawInput
     participant "Main Thread\n(UI/SDL)" as ClientMain
     participant "TCP Receiver" as ClientTCP
     participant "UDP Receiver" as ClientUDP
@@ -22,6 +23,12 @@ activate ServerSave
 User->ClientMain: Starts App
 ClientMain->ClientMain: Setup UI & SDL
 
+opt --nuclear flag enabled
+    ClientMain->RawInput: Start Thread
+    activate RawInput
+    note right of RawInput: Polls /dev/input/event*\nUpdates atomic pressure
+end
+
 User->ClientMain: Clicks "Login" (Canvas n)
 ClientMain->ServerMain: TCP Connect (Port 6769)
 activate ServerMain
@@ -40,6 +47,12 @@ ServerUDP->ServerUDP: Bind UDP Port 6770+n
 ServerTCP-->ClientMain: MSG_WELCOME (Layer Count)
 ServerTCP-->ClientMain: MSG_CANVAS_DATA (Full Layer History)
 
+# --- SIGNATURE SYNC ---
+ClientMain->ServerTCP: MSG_SIGNATURE (256-byte Bitmap)
+ServerTCP->ServerTCP: Store Signature in User Struct
+ServerTCP->ClientTCP: Broadcast MSG_SIGNATURE (to ALL in room)
+ClientTCP->ClientMain: Store Remote Signature
+
 ClientMain->ClientTCP: Start TCP Receiver Thread
 activate ClientTCP
 ClientMain->ClientUDP: Start UDP Receiver Thread (Port 6772)
@@ -49,6 +62,9 @@ activate ClientUDP
 note over User, ServerUDP: Real-time Drawing (UDP)
 
 User->ClientMain: Drag Mouse (Draw)
+opt --nuclear
+    ClientMain->RawInput: Read Atomic Pressure
+end
 ClientMain->ClientMain: Apply Locally (Immediate Feedback)
 ClientMain->ServerUDP: MSG_DRAW (UDP Packet)
 
@@ -63,12 +79,17 @@ ClientMain->User: Render Frame
 note over User, ServerUDP: Cursor Synchronization (UDP)
 
 User->ClientMain: Move Mouse
-ClientMain->ServerUDP: MSG_CURSOR (UDP Packet)
-ServerUDP->ClientUDP: Broadcast MSG_CURSOR (to other clients)
-note right of ServerUDP: Sent to everyone EXCEPT sender
+ClientMain->ClientMain: Check Deduplication (Delta Check)
+alt Position Changed
+    ClientMain->ServerUDP: MSG_CURSOR (UDP Packet)
+    ServerUDP->ClientUDP: Broadcast MSG_CURSOR (to other clients)
+    note right of ServerUDP: Sent to everyone EXCEPT sender
 
-ClientUDP->ClientMain: Update remote_cursors Map
-ClientMain->User: Render Remote Cursors
+    ClientUDP->ClientMain: Update remote_cursors Map
+    ClientMain->User: Render Remote Cursors
+else Position Unchanged
+    ClientMain->ClientMain: Drop Packet (Optimization)
+end
 
 # --- LAYER MANAGEMENT FLOW (TCP) ---
 note over User, ServerTCP: Layer Operations (TCP)
@@ -92,6 +113,18 @@ ServerTCP->ClientTCP: Broadcast MSG_LAYER_DEL (Deleted Layer ID)
 ClientTCP->ClientTCP: Delete Layer Locally
 ClientTCP->ClientMain: Set pendingLayerUpdate = true
 ClientMain->ClientMain: Update UI Buttons
+
+User->ClientMain: Drag Layer Button (Reorder)
+ClientMain->ServerTCP: MSG_LAYER_REORDER (OldIdx, NewIdx)
+ServerTCP->ServerTCP: Swap Layers in Memory
+ServerTCP->ClientTCP: Broadcast MSG_LAYER_REORDER
+ClientTCP->ClientMain: Swap Layers Locally
+
+User->ClientMain: Ctrl+Drag Canvas (Move Layer)
+ClientMain->ServerTCP: MSG_LAYER_MOVE (dx, dy)
+ServerTCP->ServerTCP: Apply Offset to Layer
+ServerTCP->ClientTCP: Broadcast MSG_LAYER_MOVE
+ClientTCP->ClientMain: Apply Offset Locally
 
 # --- UNDO / REDO SYNC FLOW ---
 note over User, ServerTCP: Undo/Redo Synchronization (TCP)
