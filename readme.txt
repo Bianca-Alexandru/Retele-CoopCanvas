@@ -1,12 +1,10 @@
-* Precompiled versions of both server and client have been provided *
-* canvas.json will be created by the server if it doesn't exist but it is also provided as a clear example of how the data is kept *
-
 DEPENDENCIES
 ------------
-Client: Requires SDL2 library (sudo apt-get install libsdl2-dev)
-        Requires brushes.h and ui.h in the same folder
-Server: Standard C++ libraries only
-        Requires brushes.h in the same folder
+Client: Requires SDL2 libraries (sudo apt-get install libsdl2-dev libsdl2-image-dev)
+        Requires brushes.h, ui.h, undo.h, and RawInput.h in the same folder.
+        Requires ui.json in the same folder for the animated menu.
+Server: Standard C++ libraries.
+        Requires brushes.h in the same folder.
 
 COMPILATION
 -----------
@@ -16,15 +14,13 @@ COMPILATION
 2. Server:
    g++ server.cpp -o server -lpthread -DSERVER_SIDE
 
-   (-DSERVER_SIDE flag disables sdl2 dependency from brushes.h)
+   (-DSERVER_SIDE flag disables SDL2 dependency in brushes.h)
 
 USAGE
 -----
-1. Start the Server first:
+1. Start the Server:
    ./server
 
-2. Start one or more Clients:
+2. Start Clients:
    ./client [server_ip]
-   sudo ./client --nuclear        (if pen pressure doesn't get detected)
-
-   //Port is hardcoded for ease of use
+   sudo ./client [server_ip] --nuclear   (Use sudo if pen pressure is not detected)

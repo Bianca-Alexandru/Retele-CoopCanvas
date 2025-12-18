@@ -162,10 +162,6 @@ int lastStableAngle = 0; // Keeps track of the last valid drawing angle
 int lastSentPressure = -1; // Track last sent pressure to detect changes
 bool isEyedropping = false; // New state for eyedropper tool
 
-// Undo Timeout
-uint32_t lastActionTime = 0;
-const uint32_t UNDO_TIMEOUT_MS = 15000; // 15 sec
-
 // Viewport / Panning
 int viewOffsetX = 0;
 int viewOffsetY = 0;
@@ -287,7 +283,34 @@ void push_undo_command(Command* cmd) {
         delete undoStack.front();
         undoStack.erase(undoStack.begin());
     }
-    lastActionTime = SDL_GetTicks(); // Update timestamp
+}
+
+// Helper to clean expired commands
+void clean_expired_commands() {
+    Uint32 now = SDL_GetTicks();
+    const Uint32 EXPIRATION_TIME = 15000; // 15 seconds
+
+    // Clean Undo Stack
+    auto it = undoStack.begin();
+    while (it != undoStack.end()) {
+        if (now - (*it)->timestamp > EXPIRATION_TIME) {
+            delete *it;
+            it = undoStack.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Clean Redo Stack
+    it = redoStack.begin();
+    while (it != redoStack.end()) {
+        if (now - (*it)->timestamp > EXPIRATION_TIME) {
+            delete *it;
+            it = redoStack.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 bool strokeInProgress = false;
@@ -1395,15 +1418,6 @@ void perform_undo() {
         return;
     }
 
-    // Check Timeout
-    uint32_t now = SDL_GetTicks();
-    if (now - lastActionTime > UNDO_TIMEOUT_MS) {
-        // printf("[Client] Undo expired! (Time limit exceeded)\n");
-        // Optional: Clear stack to prevent confusion?
-        // clear_undo_stack(); 
-        return;
-    }
-
     // 1. Get last command
     Command* cmd = undoStack.back();
     undoStack.pop_back();
@@ -1422,7 +1436,6 @@ void perform_undo() {
     }
     
     // printf("[Client] Undid action.\n");
-    lastActionTime = now; // Reset timer on action
 }
 
 void perform_redo() {
@@ -2798,6 +2811,9 @@ int main(int argc, char* argv[]) {
             pendingLayerUpdate = false;
             UpdateLayerButtons();
         }
+
+        // Clean expired undo/redo commands
+        clean_expired_commands();
 
         // --- SIGNATURE IMPLEMENTATION START ---
         // Check for pending signatures
