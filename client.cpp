@@ -49,7 +49,7 @@ void print_tutorial_controls() {
     std::cout << " [1-7]       Select Brush (Round, Square, Eraser...)\n";
     std::cout << " [Q] / [W]   Decrease / Increase Brush Size\n";
     std::cout << " [A] / [S]   Decrease / Increase Opacity\n";
-    std::cout << " [ [ ] / [ ] ] Select Previous / Next Layer\n";
+    std::cout << " [ [ / ] ] Select Previous / Next Layer\n";
     std::cout << " [Ctrl]+[Z]  Undo\n";
     std::cout << " [Ctrl]+[Y]  Redo\n";
     std::cout << " [Ctrl]+[S]  Save Canvas\n";
@@ -932,42 +932,8 @@ void* tcp_receiver_thread(void* arg) {
                     memcpy(ps.data, msg.data, 256); // Updated to 256 bytes
                     pendingSignatures.push_back(ps);
                     pendingSigUpdate = true;
-                    
-                    // If this is the first time we see a signature and we don't have an ID yet,
-                    // and we just sent ours, maybe this is ours?
-                    // The server echoes our signature back.
-                    // We can assume the first one we get after login that matches our data is ours,
-                    // OR we just treat all of them as remote, and if we happen to draw our own, so be it.
-                    // But the requirement says "client cannot see their own signature".
-                    // We'll handle this in the main thread by checking if we are the sender.
-                    // Wait, we don't know if we are the sender unless we know our ID.
-                    // We'll assume the server sends us our ID in the MSG_SIGNATURE packet.
-                    // If we haven't set myUserId yet, and we just sent a signature, this might be it.
-                    // But simpler: The server sends existing clients first. Then ours.
-                    // Actually, we can just set myUserId when we receive the echo of our own signature.
-                    // But how do we know it's ours?
-                    // We'll assume the last one received after we send is ours? No.
-                    // We'll just render all other IDs. We need to know our ID.
-                    // Let's assume for now we render everyone else.
-                    // If we see a cursor moving that matches our mouse, that's us.
-                    // But we need to filter by ID.
-                    // Let's assume the server sends a special "You are ID X" packet or we infer it.
-                    // For now, we'll store all of them.
                     if (myUserId == 0) {
-                         // Heuristic: If we just logged in, and we receive a signature that matches what we sent...
-                         // But we don't have what we sent easily accessible here.
-                         // Let's just store it.
-                         // Actually, we can use the fact that we don't receive cursor updates for ourselves via UDP usually?
-                         // No, UDP is broadcast to everyone usually.
-                         // If we receive a cursor update with ID X, and it matches our local mouse position exactly...
-                         // We'll handle ID assignment in main thread logic if possible.
-                         // For now, just store.
-                         if (myUserId == 0) myUserId = msg.user_id; // First one is us? No, existing users come first.
-                         // Actually, we can't easily know our ID without a dedicated packet.
-                         // But we can just render all signatures that have a corresponding cursor update.
-                         // We won't receive cursor updates for ourselves from the server if the server filters them?
-                         // Server code: "if (sock != client_sock)" for TCP, but for UDP "broadcast_udp" sends to all?
-                         // Let's check server broadcast_udp.
+                         if (myUserId == 0) myUserId = msg.user_id; 
                     }
                 }
                 pthread_mutex_unlock(&sigMutex);
@@ -996,11 +962,6 @@ void* tcp_receiver_thread(void* arg) {
                     
                     // --- NEW LOGIC START ---
                     if (pendingMyNewLayer) {
-                        // If I requested this, auto-select the new layer
-                        // usually the new layer is at the end (layerCount - 1) 
-                        // or at msg.layer_id if you support insertion
-                        
-                        // If msg.layer_id is reliable (index where it was added):
                         currentLayerId = msg.layer_id; 
                         
                         // Or if you always append to top:
@@ -1348,24 +1309,8 @@ void* udp_receiver_thread(void* arg) {
                             int minY = min(pkt->y, pkt->ey) - brushSize;
                             int w = abs(pkt->ex - pkt->x) + brushSize * 2;
                             int h = abs(pkt->ey - pkt->y) + brushSize * 2;
-                            // We can just mark the whole rect
-                            // Or iterate. For simplicity, let's mark the start and end, 
-                            // but ideally we should mark the whole area.
-                            // The existing mark_layer_dirty handles a rect around a point.
-                            // Let's just mark the bounding box.
-                            // But mark_layer_dirty implementation might expect a point and size.
-                            // Let's check mark_layer_dirty.
-                            // It seems to take x, y, size.
-                            // We'll just mark the start and end for now, or maybe the middle?
-                            // Actually, since we modified pixels directly, we need to ensure the GPU updates.
-                            // Let's mark the whole bounding box by calling it on the center with a large size?
-                            // No, that's hacky.
-                            // Let's just mark the start and end points with a size covering the distance?
-                            // No.
-                            // Let's just mark the start and end. The dirty rect logic in client might merge them?
                             mark_layer_dirty(layer_idx, pkt->x, pkt->y, brushSize);
                             mark_layer_dirty(layer_idx, pkt->ex, pkt->ey, brushSize);
-                            // And the middle point to be safe
                             mark_layer_dirty(layer_idx, (pkt->x + pkt->ex)/2, (pkt->y + pkt->ey)/2, brushSize);
                             pthread_mutex_unlock(&layerMutex);
                         }
@@ -1378,14 +1323,13 @@ void* udp_receiver_thread(void* arg) {
                         // Update remote cursor position
                         // Use brush_id as user_id
                         int uid = pkt->brush_id;
-                        // // printf("UDP Cursor Update: UID=%d  X=%d Y=%d\n", uid, pkt->x, pkt->y);
+                        // printf("UDP Cursor Update: UID=%d  X=%d Y=%d\n", uid, pkt->x, pkt->y);
                         if (uid != myUserId) { // Don't track ourselves
-                            // // printf("[Client][UDP] Updating cursor for UID %d (My ID: %d)\n", uid, myUserId);
+                            // printf("[Client][UDP] Updating cursor for UID %d (My ID: %d)\n", uid, myUserId);
                             pthread_mutex_lock(&remoteClientsMutex);
                             remoteClients[uid].x = pkt->x;
                             remoteClients[uid].y = pkt->y;
                             
-                            // <--- Add these lines to update color
                             remoteClients[uid].r = pkt->r;
                             remoteClients[uid].g = pkt->g;
                             remoteClients[uid].b = pkt->b;
@@ -1436,8 +1380,6 @@ void init_layer(int layer_idx, bool white) {
 
 // Wrappers for UI buttons
 void record_add_layer_command() {
-    // Adding is tricky because we don't know the ID yet.
-    // For now, we'll just clear redo stack to avoid inconsistencies.
     clear_redo_stack();
 }
 
@@ -1735,9 +1677,7 @@ void clear_signature(SDL_Renderer* renderer) {
 }
 
 void composite_layers() {
-    // Deprecated: GPU compositing is now used.
-    // This function is kept empty to satisfy any legacy calls, 
-    // but the real work happens in the render loop.
+    // no longer needed 
 }
 
 void update_canvas_texture() {
@@ -1833,9 +1773,9 @@ void download_as_bmp() {
     
     // Save as BMP
     if (SDL_SaveBMP(surface, filename) == 0) {
-        // printf("[Client][Download] Saved canvas to: %s\n", filename);
+        printf("[Client][Download] Saved canvas to: %s\n", filename);
     } else {
-        // printf("[Client][Download] ERROR: Failed to save BMP: %s\n", SDL_GetError());
+        printf("[Client][Download] ERROR: Failed to save BMP: %s\n", SDL_GetError());
     }
     
     SDL_FreeSurface(surface);
@@ -2019,7 +1959,7 @@ void handle_events() {
             case SDL_MOUSEBUTTONDOWN:
                 // Ignore mouse events simulated from touch to avoid double-drawing
                 if (e.button.which == SDL_TOUCH_MOUSEID) {
-                    // // printf("[Client][Input] Ignoring simulated mouse down\n");
+                    // printf("[Client][Input] Ignoring simulated mouse down\n");
                     break;
                 }
 
@@ -2100,8 +2040,8 @@ void handle_events() {
                                         if (p >= 0.0f) pressure = (int)(p * 255);
                                     }
                                     
-                                    // NOTE: We do NOT draw immediately here.
-                                    // We wait for the first motion to determine angle.
+                                    // NOTE: do NOT draw immediately here.
+                                    // wait for the first motion to determine angle.
                                     // If no motion occurs (just a click), we handle it in MOUSEBUTTONUP.
                                 }
                             }
@@ -2392,7 +2332,7 @@ void handle_events() {
                             float p = RawInput_GetPressure();
                             if (p >= 0.0f) {
                                 pressure = (int)(p * 255);
-                                // // printf("[Client][Input] Raw Pressure: %.2f -> %d\n", p, pressure);
+                                // printf("[Client][Input] Raw Pressure: %.2f -> %d\n", p, pressure);
                             }
                         }
                         
@@ -2453,12 +2393,12 @@ void handle_events() {
 
             case SDL_CONTROLLERAXISMOTION:
                 // Debugging: Check if tablet pressure is being sent as a joystick axis
-                // // printf("[Client][Input] Axis Motion: Axis %d Value %d\n", e.caxis.axis, e.caxis.value);
+                // printf("[Client][Input] Axis Motion: Axis %d Value %d\n", e.caxis.axis, e.caxis.value);
                 break;
 
             case SDL_JOYAXISMOTION:
                 // Debugging: Check if tablet pressure is being sent as a joystick axis
-                // // printf("[Client][Input] Joystick Axis: Axis %d Value %d\n", e.jaxis.axis, e.jaxis.value);
+                //  printf("[Client][Input] Joystick Axis: Axis %d Value %d\n", e.jaxis.axis, e.jaxis.value);
                 break;
 
             case SDL_KEYDOWN:
@@ -2501,7 +2441,6 @@ void handle_events() {
                         if (loggedin) {
                             // printf("[Client] Logging out...\n");
                             
-                            // --- FIX: FORCE CURSOR VISIBLE ---
                             SDL_ShowCursor(SDL_ENABLE);
 
                             // 1. Disconnect Network
@@ -2564,7 +2503,7 @@ void handle_events() {
                                 int op = availableBrushes[currentBrushId]->opacity;
                                 op = min(255, op + 10);
                                 availableBrushes[currentBrushId]->opacity = op;
-                                // printf("[Client][Brush] Opacity increased to %d\n", op);
+                                //printf("[Client][Brush] Opacity increased to %d\n", op);
                             }
                         }
                         break;
@@ -2574,7 +2513,7 @@ void handle_events() {
                             int op = availableBrushes[currentBrushId]->opacity;
                             op = max(0, op - 10);
                             availableBrushes[currentBrushId]->opacity = op;
-                            // printf("[Client][Brush] Opacity decreased to %d\n", op);
+                            //printf("[Client][Brush] Opacity decreased to %d\n", op);
                         }
                         break;
                     case SDLK_z:
@@ -2621,13 +2560,13 @@ void handle_events() {
                     case SDLK_LEFT:
                         if (currentLayerId > 0 && currentLayerId < MAX_LAYERS) {
                             layerOpacity[currentLayerId] = max(0, layerOpacity[currentLayerId] - 25);
-                            // printf("[Client][Layer] Layer %d opacity: %d\n", currentLayerId, layerOpacity[currentLayerId]);
+                            //printf("[Client][Layer] Layer %d opacity: %d\n", currentLayerId, layerOpacity[currentLayerId]);
                         }
                         break;
                     case SDLK_RIGHT:
                         if (currentLayerId > 0 && currentLayerId < MAX_LAYERS) {
                             layerOpacity[currentLayerId] = min(255, layerOpacity[currentLayerId] + 25);
-                            // printf("[Client][Layer] Layer %d opacity: %d\n", currentLayerId, layerOpacity[currentLayerId]);
+                            //printf("[Client][Layer] Layer %d opacity: %d\n", currentLayerId, layerOpacity[currentLayerId]);
                         }
                         break;
                     default:

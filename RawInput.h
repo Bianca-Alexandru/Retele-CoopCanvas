@@ -53,9 +53,9 @@ inline char* find_tablet_device() {
             if (TEST_BIT(ABS_PRESSURE, absbit)) {
                 // Get pressure range
                 if (ioctl(fd, EVIOCGABS(ABS_PRESSURE), &absinfo) >= 0) {
-                    ::printf("[RawInput] >>> FOUND PRESSURE DEVICE: %s (%s) Max Pressure: %d\n", path, name, absinfo.maximum);
+                    //printf("[RawInput] >>> FOUND PRESSURE DEVICE: %s (%s) Max Pressure: %d\n", path, name, absinfo.maximum);
                 } else {
-                    ::printf("[RawInput] >>> FOUND PRESSURE DEVICE: %s (%s) (Could not read max pressure)\n", path, name);
+                    //printf("[RawInput] >>> FOUND PRESSURE DEVICE: %s (%s) (Could not read max pressure)\n", path, name);
                 }
                 close(fd);
                 return strdup(path);
@@ -70,7 +70,6 @@ inline char* find_tablet_device() {
 
 #include <sys/poll.h>
 
-// ... (includes)
 
 // The thread loop
 inline void* input_thread_func(void* arg) {
@@ -79,7 +78,7 @@ inline void* input_thread_func(void* arg) {
     pfd.fd = device_fd;
     pfd.events = POLLIN;
     
-    ::printf("[RawInput] Thread started. Reading from fd %d...\n", device_fd);
+    //printf("[RawInput] Thread started. Reading from fd %d...\n", device_fd);
 
     while (is_running) {
         // Use poll with 100ms timeout to allow checking is_running
@@ -115,7 +114,7 @@ inline void* input_thread_func(void* arg) {
         }
     }
     
-    ::printf("[RawInput] Thread stopping.\n");
+    //printf("[RawInput] Thread stopping.\n");
     return NULL;
 }
 
@@ -124,14 +123,14 @@ inline bool RawInput_Start(void) {
 
     char* dev_path = find_tablet_device();
     if (!dev_path) {
-        ::printf("[RawInput] No tablet device found in /dev/input/by-id/\n");
+        //printf("[RawInput] No tablet device found in /dev/input/by-id/\n");
         return false;
     }
 
     device_fd = open(dev_path, O_RDONLY);
     if (device_fd < 0) {
-        ::printf("[RawInput] Failed to open %s: %s\n", dev_path, strerror(errno));
-        ::printf("[RawInput] Try running with sudo?\n");
+        printf("[RawInput] Failed to open %s: %s\n", dev_path, strerror(errno));
+        printf("[RawInput] Try running with sudo?\n");
         free(dev_path);
         return false;
     }
@@ -140,7 +139,7 @@ inline bool RawInput_Start(void) {
     struct input_absinfo absinfo;
     if (ioctl(device_fd, EVIOCGABS(ABS_PRESSURE), &absinfo) >= 0) {
         max_pressure = absinfo.maximum;
-        ::printf("[RawInput] Device max pressure: %d\n", (int)max_pressure);
+        //printf("[RawInput] Device max pressure: %d\n", (int)max_pressure);
     }
 
     free(dev_path);
@@ -168,7 +167,7 @@ inline void RawInput_Stop(void) {
         close(device_fd);
         device_fd = -1;
     }
-    ::printf("[RawInput] Stopped.\n");
+    //printf("[RawInput] Stopped.\n");
 }
 
 inline float RawInput_GetPressure(void) {

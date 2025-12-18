@@ -341,9 +341,8 @@ void broadcast_tcp(CanvasRoom* room, const TCPMessage& msg, int exclude_sock = -
     for (int sock : room->tcp_clients) {
         if (sock != exclude_sock) {
             if (!write_all(sock, &msg, sizeof(TCPMessage))) {
-                // If write fails, we can't easily remove the client here without locking issues
-                // But the next read/write will likely fail and clean it up.
-                // For now, just ignore the error to prevent crashing.
+                perror("Broadcast failed: closing dead socket"); 
+                close(sock); 
             }
         }
     }
@@ -621,7 +620,7 @@ bool start_canvas_thread(int canvas_id) {
 
 static const string b64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-// PackBits Compression (RLE variant)
+// PackBits Compression 
 // Header N:
 // [0, 127]   -> (N+1) literal bytes follow
 // [-127, -1] -> Repeat next byte (1-N) times (2 to 128 times)
@@ -1398,8 +1397,7 @@ void* tcp_client_session(void* arg) {
 int main() {
     signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent server crash on client disconnect
     printf("============================================\n");
-    printf("  Co-op Canvas Server v4.0\n");
-    printf("  Multi-Layer + On-Demand Canvases\n");
+    printf("  Co-op Canvas Server\n");
     printf("============================================\n\n");
     
     printf("[Server][Init] On-demand canvas system ready\n");

@@ -135,9 +135,6 @@ public:
 };
 
 // --- NEW / MODIFIED BRUSHES ---
-
-// 1. REAL PAINT BRUSH (Replaces the old textured brush)
-// 4. TEXTURE BRUSH (Restored "Organic" Version)
 class TexturedBrush : public Brush {
     // A smoother bristle map. Lower numbers are gaps between bristles.
     const float bristles[32] = { 
@@ -172,7 +169,6 @@ public:
             int patternIndex = abs(i) % 32; 
             float bristleStrength = bristles[patternIndex];
 
-            // THE NEW MATH: Pressure fills in the gaps.
             // If pressure is high (1.0), combined strength becomes >= 1.0 everywhere.
             // If pressure is low, the bristle map dominates.
             float combinedStrength = bristleStrength + (pressurePower * 0.8f);

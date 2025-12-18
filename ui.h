@@ -149,7 +149,7 @@ class LoginButton : public Button {
 public:
     void Draw(SDL_Renderer* r) override { /* Invisible for Main Menu Art */ }
     void Click() override { 
-        ::printf("[Client][UI] Login button clicked for canvas #%d\n", currentCanvasId);
+        // printf("[Client][UI] Login button clicked for canvas #%d\n", currentCanvasId);
         send_tcp_login("Artist"); 
     }
 };
@@ -160,7 +160,7 @@ public:
     void Click() override { 
         if (currentCanvasId > 0) {
             currentCanvasId--;
-            ::printf("[Client][UI] Lobby changed to canvas #%d\n", currentCanvasId);
+            // printf("[Client][UI] Lobby changed to canvas #%d\n", currentCanvasId);
         }
     }
 };
@@ -171,7 +171,7 @@ public:
     void Click() override { 
         if (currentCanvasId < 99) {
             currentCanvasId++;
-            ::printf("[Client][UI] Lobby changed to canvas #%d\n", currentCanvasId);
+            // printf("[Client][UI] Lobby changed to canvas #%d\n", currentCanvasId);
         }
     }
 };
@@ -479,9 +479,8 @@ inline void SetupUI() {
     for (auto* b : buttons) delete b;
     buttons.clear();
 
-    // === PART 1: MAIN MENU (KEEP YOUR HAND DRAWN ART) ===
-    // Coordinates matched to your art
-    // Use MENU_WIDTH (640) for centering logic
+    // === PART 1: MAIN MENU  ===
+    // using hand drawn art
     int menuW = 640; 
     
     LoginButton* loginBtn = new LoginButton();
@@ -497,7 +496,7 @@ inline void SetupUI() {
     rightBtn->x = 370; rightBtn->y = 30; rightBtn->w = 200; rightBtn->h = 80;
     buttons.push_back(rightBtn); // 2
 
-    // === PART 2: CANVAS UI (RESTORE THE OLD STYLE) ===
+    // === PART 2: CANVAS UI ===
     // Tools (Indices 3+)
     ColorPicker* colp = new ColorPicker();
     colp->x = 10; colp->y = 10; colp->w = 100; colp->h = 100;
@@ -533,12 +532,11 @@ inline void SetupUI() {
 }
 
 inline void draw_ui(SDL_Renderer* renderer, bool uiVisible, std::function<void(SDL_Renderer*)> postCanvasCallback = nullptr) {
-    // 1. Clear with dark grey (The Void) - Updated to Grayish Dark Blue
+    // 1. Clear with dark grey blue
     SDL_SetRenderDrawColor(renderer, 40, 40, 60, 255);
     SDL_RenderClear(renderer);
 
     if (!loggedin) {
-        // --- DRAW MAIN MENU (KEEP EXACTLY AS IS) ---
         // Use fixed 640x480 rect for menu texture
         SDL_Rect menuRect = {0, 0, 640, 480};
         
@@ -566,9 +564,9 @@ inline void draw_ui(SDL_Renderer* renderer, bool uiVisible, std::function<void(S
         return;
     }
 
-    // --- DRAW CANVAS UI (RESTORED OLD STYLE) ---
+    // --- DRAW CANVAS UI ---
     
-    // 2. Define Viewport (The Canvas Position)
+    //  Define Viewport 
     SDL_Rect destRect = {viewOffsetX, viewOffsetY, UI_WIDTH, UI_HEIGHT};
 
     // Draw Canvas Layers
@@ -663,7 +661,7 @@ inline bool handle_canvas_ui_click(int x, int y) {
                 dragLayerId = lb->layerId;
                 dragStartY = y;
                 dragCurrentY = y;
-                ::printf("[Client][UI] Started dragging layer %d\n", dragLayerId);
+                // printf("[Client][UI] Started dragging layer %d\n", dragLayerId);
             }
             
             btn->Click();
@@ -690,7 +688,7 @@ inline void handle_drag_end(int x, int y) {
         if (newIdx > numDrawableLayers) newIdx = numDrawableLayers;
         
         if (newIdx != dragLayerId) {
-            ::printf("[Client][UI] Dropped layer %d at index %d\n", dragLayerId, newIdx);
+            // printf("[Client][UI] Dropped layer %d at index %d\n", dragLayerId, newIdx);
             send_tcp_reorder_layer(dragLayerId, newIdx);
         }
         
