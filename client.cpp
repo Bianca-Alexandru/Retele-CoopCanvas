@@ -49,11 +49,11 @@ void print_tutorial_controls() {
     std::cout << " [1-7]       Select Brush (Round, Square, Eraser...)\n";
     std::cout << " [Q] / [W]   Decrease / Increase Brush Size\n";
     std::cout << " [A] / [S]   Decrease / Increase Opacity\n";
-    std::cout << " [ [ / ] ] Select Previous / Next Layer\n";
+    std::cout << " [[] / []] Select Previous / Next Layer\n";
     std::cout << " [Ctrl]+[Z]  Undo\n";
     std::cout << " [Ctrl]+[Y]  Redo\n";
     std::cout << " [Ctrl]+[S]  Save Canvas\n";
-    std::cout << " [Ctrl]+Drag Move Canvas\n";
+    std::cout << " [Ctrl]+Drag Move Layer\n";
     std::cout << " [Space]+Drag Pan Canvas\n";
     std::cout << "========================================\n";
     std::cout << "Happy Drawing!\n\n";
@@ -431,24 +431,6 @@ bool compress_signature(uint8_t* out_buffer) {
     // Block size: 10x10
     for (int y = 0; y < 15; y++) {
         for (int x = 0; x < 45; x++) {
-            // Average 15x15 block -> CHANGED to 5x5 block for higher resolution
-            // 450 / 5 = 90 blocks wide
-            // 150 / 5 = 30 blocks high
-            // Total blocks = 2700
-            // 2700 * 2 bits = 5400 bits = 675 bytes.
-            // Wait, we only have 128 bytes in the payload?
-            // The struct TCPMessage has char data[256].
-            // We can use up to 256 bytes.
-            
-            // Let's try 10x10 blocks.
-            // 450 / 10 = 45 blocks wide
-            // 150 / 10 = 15 blocks high
-            // Total = 675 blocks.
-            // 675 * 2 bits = 1350 bits = 169 bytes. Fits in 256!
-            
-            // Previous was 15x15 blocks -> 30x10 grid = 300 blocks = 75 bytes.
-            
-            // NEW LOGIC: 10x10 blocks
             int sumAlpha = 0;
             for (int dy = 0; dy < 10; dy++) {
                 for (int dx = 0; dx < 10; dx++) {

@@ -1,14 +1,3 @@
-/* 
-   COOP CANVAS SERVER TLDR
-   
-   -Main thread accepts TCP connections and routes clients
-   -One thread per active canvas handles UDP traffic
-   -Autosave thread periodically saves all canvases
-   -Layer 0 is white background, Layer 1+ are transparent user layers
-   -TCP used for Login, Save, Layer ops
-   -UDP used for Draw, Line, Cursor
-   -TCP port at 6769, UDP ports start at 6770 + canvasID
-*/
 
 #include <sys/types.h>
 #include <sys/socket.h>
